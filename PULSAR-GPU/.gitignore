@@ -1,0 +1,13 @@
+/build/
+/cmake-build-*/
+/.cache/
+__pycache__/
+*.py[cod]
+*.log
+*.out
+*.csv
+*.json
+core
+core.*
+.vscode/
+.idea/
