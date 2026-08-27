@@ -7,8 +7,8 @@ threads="${3:-${OMP_NUM_THREADS:-12}}"
 output_refresh="${4:-1}"
 
 case "${operation}" in
-  add|gt|eq|xor) ;;
-  *) echo "operation must be add, gt, eq, or xor" >&2; exit 2 ;;
+  add|gt|eq|xor|mixed) ;;
+  *) echo "operation must be add, gt, eq, xor, or mixed" >&2; exit 2 ;;
 esac
 
 case "${width}" in

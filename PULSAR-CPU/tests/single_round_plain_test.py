@@ -70,10 +70,12 @@ def main() -> None:
         mask = (1 << width) - 1
         left = [randomizer.getrandbits(width) for _ in range(words)]
         right = [randomizer.getrandbits(width) for _ in range(words)]
+        third = [randomizer.getrandbits(width) for _ in range(words)]
         for word in (4, words // 2, words - 1):
             right[word] = left[word]
         left_bits = encode(left, width)
         right_bits = encode(right, width)
+        third_bits = encode(third, width)
 
         add_bits = encode([(a + b) & mask for a, b in zip(left, right)], width)
         xor_bits = [a ^ b for a, b in zip(left_bits, right_bits)]
@@ -82,6 +84,10 @@ def main() -> None:
         eq_bits = prefix_equal(left_bits, right_bits, width)
         eq_words = [int(a == b) for a, b in zip(left, right)]
         mul_words = [(a * b) & mask for a, b in zip(left, right)]
+        mixed_value_bits = [a ^ b for a, b in zip(add_bits, third_bits)]
+        mixed_values = decode(mixed_value_bits, width)
+        mixed_words = [int(value > a) for value, a in zip(mixed_values, left)]
+        mixed_bits = broadcast(mixed_words, width)
 
         assert decode(add_bits, width) == [
             (a + b) & mask for a, b in zip(left, right)]
@@ -91,9 +97,10 @@ def main() -> None:
             start = bit * words
             assert gt_bits[start:start + words] == gt_words
             assert eq_bits[start:start + words] == eq_words
+            assert mixed_bits[start:start + words] == mixed_words
         print(
             f"width={width:3d} native_batch={words:4d} "
-            "ADD/GT/EQ/XOR/MUL PASS")
+            "ADD/GT/EQ/XOR/MIXED/MUL PASS")
     print("overall verdict: PASS")
 
 

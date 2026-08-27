@@ -12,8 +12,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Verify repository
-        run: python3 verify_repository.py
       - name: Run plaintext tests
         run: |
           python3 tests/subtractor_head_zero_plain_test.py

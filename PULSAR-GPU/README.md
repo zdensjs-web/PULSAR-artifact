@@ -1,8 +1,15 @@
 # PULSAR-GPU
 
-PULSAR-GPU is the GPU implementation of the PULSAR fixed-width integer operators. It evaluates Boolean-encoded encrypted integers with CKKS and uses [FIDESlib](https://github.com/CAPS-UMU/FIDESlib) as the CUDA backend. The implementation supports packed execution, complex-slot prefix computation, and multi-GPU execution.
+PULSAR-GPU is the GPU implementation of the PULSAR fixed-width integer
+operators and application benchmarks. It evaluates Boolean-encoded encrypted
+integers with CKKS and uses
+[FIDESlib](https://github.com/CAPS-UMU/FIDESlib) as the CUDA backend. The
+implementation supports packed execution, complex-slot prefix computation,
+and multi-GPU execution.
 
-This repository is a research artifact. The current release contains the production operator executables and plaintext regression tests. End-to-end application drivers are not included in this release.
+This repository is a research artifact. The current release contains the
+operator executables, the application drivers used by the GPU evaluation, and
+plaintext regression tests.
 
 ## Operators
 
@@ -13,6 +20,7 @@ PULSAR-GPU supports power-of-two word widths from 8 to 256 bits. The default wid
 | Arithmetic | Addition | `pulsar_gpu_add` |
 | Arithmetic | Subtraction | `pulsar_gpu_sub` |
 | Arithmetic | Multiplication modulo `2^w` | `pulsar_gpu_mul` |
+| Arithmetic | Public-scalar multiplication modulo `2^256` | `pulsar_gpu_scalar_mul` |
 | Division | Public-scalar division | `pulsar_gpu_scalar_div` |
 | Division | Ciphertext-ciphertext division | `pulsar_gpu_div` |
 | Comparison | `GT`, `GE`, `LT`, `LE`, `EQ`, `NE` | `pulsar_gpu_gt`, `pulsar_gpu_ge`, `pulsar_gpu_lt`, `pulsar_gpu_le`, `pulsar_gpu_eq`, `pulsar_gpu_ne` |
@@ -20,7 +28,25 @@ PULSAR-GPU supports power-of-two word widths from 8 to 256 bits. The default wid
 | Shift | Public left/right shift | `pulsar_gpu_scalar_shl`, `pulsar_gpu_scalar_shr` |
 | Shift | Encrypted left/right shift | `pulsar_gpu_shl`, `pulsar_gpu_shr` |
 
-Addition, subtraction, and comparison use a parallel-prefix circuit with complex packing. Bit positions are packed across CKKS slots to evaluate many integers in parallel. Arithmetic and comparison executables perform the final ciphertext refresh required by their standalone benchmark contract. `NOT` does not perform bootstrapping.
+Addition, subtraction, and comparison use a parallel-prefix circuit with
+complex packing. Bit positions are packed across CKKS slots to evaluate many
+integers in parallel. Arithmetic and comparison executables perform the final
+ciphertext refresh required by their standalone benchmark contract. `NOT`
+does not perform bootstrapping.
+
+## Applications
+
+The GPU application benchmarks operate on 128 packed 256-bit integers.
+
+| Application | Computation | Executable |
+|---|---|---|
+| Transfer | Conditional encrypted balance transfer | `pulsar_gpu_transfer` |
+| Auction | Maximum of 128 encrypted bids | `pulsar_gpu_auction` |
+| Confidential Vault | Public exchange-rate multiplication followed by public rate-scale division | `pulsar_gpu_vault` |
+
+The Transfer executable contains the White Paper, No CMUX, and Overflow
+implementations used in the evaluation. The Vault output is
+`floor(((deposit * exchangeRate) mod 2^256) / rateScale)`.
 
 ## Requirements
 
@@ -65,10 +91,12 @@ cmake -S . -B build \
 cmake --build build -j"$(nproc)"
 ```
 
-All executables are written to `build/bin`. To build one operator only:
+All executables are written to `build/bin`. Individual targets can be built
+separately:
 
 ```bash
 cmake --build build --target pulsar_gpu_add -j"$(nproc)"
+cmake --build build --target pulsar_gpu_transfer -j"$(nproc)"
 ```
 
 Optional installation:
@@ -79,7 +107,8 @@ cmake --install build --prefix "$HOME/.local"
 
 ## Run
 
-Every executable accepts `--help`. The common options are:
+The operators built on the common runtime interface accept `--help`. Their
+common options are:
 
 - `--bits N`: word width, one of `8`, `16`, `32`, `64`, `128`, or `256`
 - `--words N`: number of packed words per ciphertext
@@ -111,6 +140,16 @@ CUDA_VISIBLE_DEVICES=0,1 \
 ./build/bin/pulsar_gpu_mul --bits 256 --gpus 2 --merge-batch 8
 ```
 
+### Public-scalar multiplication
+
+The argument is a decimal or hexadecimal public 256-bit scalar. This
+benchmark uses two logical GPUs.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+./build/bin/pulsar_gpu_scalar_mul 7
+```
+
 ### Ciphertext-ciphertext division
 
 The divider also accepts `--parallel-blocks N`.
@@ -120,14 +159,50 @@ CUDA_VISIBLE_DEVICES=0,1 \
 ./build/bin/pulsar_gpu_div --bits 256 --gpus 2 --parallel-blocks 2
 ```
 
-Use the executable's `--help` output as the authoritative description of supported options and defaults.
+For these operators, use `--help` as the authoritative description of
+supported options and defaults.
+
+## Run Applications
+
+The following commands reproduce the application entry points. Auction and
+Vault use three logical GPUs. Transfer uses every device exposed through
+`CUDA_VISIBLE_DEVICES`.
+
+### Transfer
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+./build/bin/pulsar_gpu_transfer all
+```
+
+Replace `all` with `whitepaper`, `no_cmux`, or `overflow` to run one Transfer
+implementation.
+
+### Auction
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+./build/bin/pulsar_gpu_auction
+```
+
+### Confidential Vault
+
+The two arguments are the public exchange rate and nonzero public rate scale.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+./build/bin/pulsar_gpu_vault 3 3
+```
+
+Setup, key generation, encryption, and decryption are reported separately
+from the online application latency. Each application decrypts its outputs and
+checks them against a plaintext reference after evaluation.
 
 ## Verification
 
 The repository includes tests for the plaintext algebra, packing rules, and level schedules. These tests do not require a GPU build:
 
 ```bash
-python3 verify_repository.py
 python3 tests/subtractor_head_zero_plain_test.py
 python3 tests/comparison_head_zero_plain_test.py
 python3 tests/word_operator_plain_test.py
@@ -137,7 +212,8 @@ python3 tests/cipher_divider_plain_test.py
 python3 tests/cipher_divider_level_schedule_test.py
 ```
 
-Full ciphertext correctness and timing must be verified on a machine with the matching FIDESlib/OpenFHE build and NVIDIA GPUs.
+Full ciphertext correctness and timing must be verified on a machine with the
+matching FIDESlib/OpenFHE build and NVIDIA GPUs.
 
 ## Repository Structure
 
@@ -145,9 +221,8 @@ Full ciphertext correctness and timing must be verified on a machine with the ma
 PULSAR-GPU/
 |-- CMakeLists.txt
 |-- README.md
-|-- src/                  # Operator implementations and shared runtime code
-|-- tests/                # Plaintext algebra and schedule regression tests
-`-- verify_repository.py  # Static package verification
+|-- src/                  # Operators, applications, and shared runtime code
+`-- tests/                # Plaintext algebra and schedule regression tests
 ```
 
 ## Acknowledgments

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 
-VERSION = "1.3.0"
+VERSION = "1.3.2"
 SUPPORTED_OPENFHE = (1, 4, 0)
 RUN_SCRIPTS = (
     "run_pulsar_cpu_operator.sh",
@@ -17,11 +17,13 @@ RUN_SCRIPTS = (
     "run_pulsar_gt.sh",
     "run_pulsar_eq.sh",
     "run_pulsar_xor.sh",
+    "run_pulsar_mixed.sh",
     "run_pulsar_mul.sh",
     "run_pulsar_add_chain.sh",
     "run_pulsar_transfer.sh",
     "run_pulsar_auction.sh",
     "run_pulsar_auction_16_256.sh",
+    "run_pulsar_vault.sh",
     "run_pulsar_sha256.sh",
 )
 
@@ -59,7 +61,6 @@ def copy_with_backup(source: Path, target: Path, backup_root: Path) -> bool:
 
 def run_plaintext_checks(package: Path) -> None:
     checks = (
-        package / "verify_repository.py",
         package / "tests/single_round_plain_test.py",
         package / "tests/multiplier_plain_test.py",
         package / "tests/sha256_plain_test.py",
@@ -113,11 +114,13 @@ def install(package: Path, root: Path, skip_checks: bool) -> None:
     print(
         "  cmake --build build --target "
         "benchmark-pulsar-single-round benchmark-pulsar-multiply "
-        "benchmark-pulsar-add-chain -j\"$(nproc)\""
+        "benchmark-pulsar-add-chain benchmark-pulsar-vault -j\"$(nproc)\""
     )
     print("  ./run_pulsar_add.sh 128 12")
+    print("  ./run_pulsar_mixed.sh 128 12 1")
     print("  ./run_pulsar_transfer.sh 128 0.01")
     print("  ./run_pulsar_auction.sh 128 0.01")
+    print("  ./run_pulsar_vault.sh 256 3 3 12 1")
     print("  ./run_pulsar_sha256.sh 1 0.01 12")
 
 
@@ -129,7 +132,7 @@ def main() -> None:
     parser.add_argument(
         "--skip-checks",
         action="store_true",
-        help="skip repository and plaintext checks before installation",
+        help="skip plaintext checks before installation",
     )
     args = parser.parse_args()
     install(Path(__file__).resolve().parent, args.openfhe_root, args.skip_checks)

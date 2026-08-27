@@ -48,6 +48,7 @@ enum class Operation {
     GreaterThan,
     Equal,
     Xor,
+    Mixed,
 };
 
 struct AuditResult {
@@ -298,7 +299,11 @@ Operation ParseOperation(const std::string& value) {
     if (value == "xor") {
         return Operation::Xor;
     }
-    throw std::invalid_argument("operation must be add, gt, eq, or xor");
+    if (value == "mixed") {
+        return Operation::Mixed;
+    }
+    throw std::invalid_argument(
+        "operation must be add, gt, eq, xor, or mixed");
 }
 
 const char* OperationName(Operation operation) {
@@ -311,6 +316,8 @@ const char* OperationName(Operation operation) {
             return "EQ";
         case Operation::Xor:
             return "XOR";
+        case Operation::Mixed:
+            return "MIXED";
     }
     throw std::logic_error("invalid operation");
 }
@@ -342,7 +349,8 @@ PlainPair EvaluatePlain(Operation operation,
                         const PlainPair& left,
                         const PlainPair& right,
                         uint32_t wordBits,
-                        uint32_t words) {
+                        uint32_t words,
+                        const PlainPair* third = nullptr) {
     PlainPair output;
     for (size_t group = 0; group < output.size(); ++group) {
         switch (operation) {
@@ -361,6 +369,18 @@ PlainPair EvaluatePlain(Operation operation,
             case Operation::Xor:
                 output[group] = PlainXor(left[group], right[group]);
                 break;
+            case Operation::Mixed: {
+                if (third == nullptr) {
+                    throw std::invalid_argument(
+                        "MIXED requires a third plaintext operand");
+                }
+                auto sum = PlainAdd(
+                    left[group], right[group], wordBits, words);
+                auto mixed = PlainXor(sum, (*third)[group]);
+                output[group] = PlainGreaterThan(
+                    mixed, left[group], wordBits, words);
+                break;
+            }
         }
     }
     return output;
@@ -393,6 +413,9 @@ CipherPair EvaluateCipher(Operation operation,
                 output[group] = dense->EvalBooleanXor(
                     left[group], right[group]);
                 break;
+            case Operation::Mixed:
+                throw std::logic_error(
+                    "MIXED is evaluated by the circuit scheduler");
         }
     }
     return output;
@@ -405,7 +428,7 @@ int main(int argc, char* argv[]) {
         std::cout << std::unitbuf;
         if (argc > 4) {
             std::cerr << "Usage: " << argv[0]
-                      << " [add|gt|eq|xor] [word_bits] [output_refresh:0|1]\n";
+                      << " [add|gt|eq|xor|mixed] [word_bits] [output_refresh:0|1]\n";
             return 2;
         }
 
@@ -496,6 +519,9 @@ int main(int argc, char* argv[]) {
         PlainPair rightPlain{
             MakeOperand(wordBits, nativeBatch, 0xB601U, 1),
             MakeOperand(wordBits, nativeBatch, 0xB602U, 1)};
+        const PlainPair thirdPlain{
+            MakeOperand(wordBits, nativeBatch, 0xC701U, 0),
+            MakeOperand(wordBits, nativeBatch, 0xC702U, 1)};
         const std::array<uint32_t, 3> equalWords{
             4, nativeBatch / 2, nativeBatch - 1};
         for (size_t group = 0; group < rightPlain.size(); ++group) {
@@ -508,7 +534,8 @@ int main(int argc, char* argv[]) {
             }
         }
         const PlainPair expected = EvaluatePlain(
-            operation, leftPlain, rightPlain, wordBits, nativeBatch);
+            operation, leftPlain, rightPlain, wordBits, nativeBatch,
+            operation == Operation::Mixed ? &thirdPlain : nullptr);
 
         CipherPair left{
             pke->Encrypt(EncodeDense(leftPlain[0], elementParams, scale)),
@@ -516,17 +543,86 @@ int main(int argc, char* argv[]) {
         CipherPair right{
             pke->Encrypt(EncodeDense(rightPlain[0], elementParams, scale)),
             pke->Encrypt(EncodeDense(rightPlain[1], elementParams, scale))};
+        CipherPair third{
+            pke->Encrypt(EncodeDense(thirdPlain[0], elementParams, scale)),
+            pke->Encrypt(EncodeDense(thirdPlain[1], elementParams, scale))};
         const auto setupEnd = std::chrono::steady_clock::now();
 
         std::cout << "[input-refresh] left B2B excluded\n";
         left = BooleanBoundaryRefresh(fhe, left[0], left[1]);
         std::cout << "[input-refresh] right B2B excluded\n";
         right = BooleanBoundaryRefresh(fhe, right[0], right[1]);
+        if (operation == Operation::Mixed) {
+            std::cout << "[input-refresh] third B2B excluded\n";
+            third = BooleanBoundaryRefresh(fhe, third[0], third[1]);
+        }
         const uint32_t inputLevel = left[0]->GetLevel();
 
         const auto operationStart = std::chrono::steady_clock::now();
-        auto output = EvaluateCipher(
-            operation, dense, left, right, wordBits, nativeBatch);
+        CipherPair output;
+        double addSeconds = 0.0;
+        double xorSeconds = 0.0;
+        double comparisonSeconds = 0.0;
+        double intermediateRefreshSeconds = 0.0;
+        uint32_t intermediateRefreshes = 0;
+        if (operation != Operation::Mixed) {
+            output = EvaluateCipher(
+                operation, dense, left, right, wordBits, nativeBatch);
+        }
+        else {
+            auto stageStart = std::chrono::steady_clock::now();
+            auto sum = EvaluateCipher(
+                Operation::Add, dense, left, right, wordBits, nativeBatch);
+            addSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stageStart).count();
+
+            stageStart = std::chrono::steady_clock::now();
+            auto mixed = EvaluateCipher(
+                Operation::Xor, dense, sum, third, wordBits, nativeBatch);
+            xorSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stageStart).count();
+
+            uint32_t prefixLayers = 0;
+            for (uint32_t distance = 1; distance < wordBits; distance <<= 1) {
+                ++prefixLayers;
+            }
+            const uint32_t comparisonDepth = prefixLayers + 3;
+            const uint32_t maximumB2BInputLevel =
+                kMultiplicativeDepth - levelBudget[1];
+            const uint32_t requiredFinalLevel =
+                mixed[0]->GetLevel() + comparisonDepth;
+            const uint32_t permittedFinalLevel = outputRefresh ?
+                maximumB2BInputLevel : kMultiplicativeDepth;
+            if (requiredFinalLevel > permittedFinalLevel) {
+                std::cout << "[schedule] instruction=GT action=boundary_B2B"
+                          << " input_level=" << mixed[0]->GetLevel()
+                          << " projected_output_level=" << requiredFinalLevel
+                          << " permitted_output_level=" << permittedFinalLevel
+                          << '\n';
+                mixed = BooleanBoundaryRefresh(
+                    fhe, mixed[0], mixed[1],
+                    &intermediateRefreshSeconds);
+                ++intermediateRefreshes;
+            }
+            else {
+                std::cout << "[schedule] instruction=GT action=direct"
+                          << " input_level=" << mixed[0]->GetLevel()
+                          << " projected_output_level=" << requiredFinalLevel
+                          << '\n';
+            }
+
+            CipherPair comparisonRight{
+                leveled->AdjustCiphertextToLevel(
+                    left[0], mixed[0]->GetLevel()),
+                leveled->AdjustCiphertextToLevel(
+                    left[1], mixed[1]->GetLevel())};
+            stageStart = std::chrono::steady_clock::now();
+            output = EvaluateCipher(
+                Operation::GreaterThan, dense, mixed, comparisonRight,
+                wordBits, nativeBatch);
+            comparisonSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stageStart).count();
+        }
         const auto operationEnd = std::chrono::steady_clock::now();
         const uint32_t rawOutputLevel = output[0]->GetLevel();
 
@@ -562,7 +658,14 @@ int main(int argc, char* argv[]) {
                   << "multiplicative_depth=" << kMultiplicativeDepth << '\n'
                   << "logQP=" << logQP << '\n'
                   << "security=HEStd_128_classic\n"
-                  << "input_refresh=two_native_B2B_calls_excluded\n"
+                  << "input_refresh="
+                  << (operation == Operation::Mixed ?
+                      "three_native_B2B_calls_excluded" :
+                      "two_native_B2B_calls_excluded") << '\n'
+                  << "instruction_sequence="
+                  << (operation == Operation::Mixed ?
+                      "ADD,XOR,GT" : OperationName(operation)) << '\n'
+                  << "intermediate_refreshes=" << intermediateRefreshes << '\n'
                   << "output_refresh="
                   << (outputRefresh ? "native_B2B_included" : "disabled") << '\n'
                   << "input_level=" << inputLevel << '\n'
@@ -576,6 +679,11 @@ int main(int argc, char* argv[]) {
                   << " batch=" << aggregateBatch
                   << " operation_s=" << std::fixed << std::setprecision(9)
                   << operationSeconds
+                  << " add_s=" << addSeconds
+                  << " xor_s=" << xorSeconds
+                  << " comparison_s=" << comparisonSeconds
+                  << " intermediate_refresh_s=" << intermediateRefreshSeconds
+                  << " intermediate_refreshes=" << intermediateRefreshes
                   << " output_refresh_s=" << outputRefreshSeconds
                   << " total_s=" << totalSeconds
                   << " amortized_ms="

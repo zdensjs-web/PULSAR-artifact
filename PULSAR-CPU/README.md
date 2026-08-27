@@ -13,12 +13,14 @@ build, or link FHE-SIMD-ALU separately. See [NOTICE](NOTICE) for provenance.
 
 ## Included benchmarks
 
-The release contains the following single-instruction benchmarks:
+The release contains the following instruction benchmarks:
 
 - `ADD`: unsigned addition modulo `2^w`.
 - `GT`: strict unsigned comparison `A > B`.
 - `EQ`: unsigned equality comparison `A == B`.
 - `XOR`: bitwise exclusive OR.
+- `MIXED`: consecutive `ADD`, `XOR`, and `GT` instructions over the same
+  Boolean representation.
 - `MUL`: unsigned multiplication modulo `2^w`.
 
 It also contains the currently validated PULSAR CPU workloads:
@@ -28,12 +30,13 @@ It also contains the currently validated PULSAR CPU workloads:
 - **Transfer:** `moved = sender >= amount ? amount : 0`, followed by sender and
   receiver updates.
 - **Auction:** a tree reduction that returns the largest encrypted bid.
+- **Vault:** multiplies each encrypted deposit by a public exchange rate and
+  divides the low `w`-bit product by a public rate scale.
 - **SHA-256:** between 1 and 64 compression rounds over one padded 512-bit
   block. A 64-round execution performs the complete compression function.
 
-MIXED, RSA, division, and the FHE-SIMD-ALU baseline applications are not part
-of this release. A PULSAR CPU implementation of Vault was not present in the
-validated source set and is therefore not included.
+RSA, encrypted division, and the FHE-SIMD-ALU baseline applications are not
+part of this release.
 
 ## Parameters and packing
 
@@ -69,7 +72,7 @@ PULSAR-CPU/
 |   `-- src/
 |       |-- core/          fixed-point and complex-transform support
 |       `-- pke/           FHEZ, PULSAR operators, schedulers, benchmarks
-|-- tests/                  plaintext and repository checks
+|-- tests/                  plaintext correctness checks
 |-- install_pulsar_openfhe.py
 |-- run_pulsar_*.sh
 |-- LICENSE
@@ -77,7 +80,7 @@ PULSAR-CPU/
 ```
 
 The installer copies the overlay into an OpenFHE source tree. Existing files
-are backed up under `.pulsar-openfhe-backup-v1.3.0/` before replacement.
+are backed up under `.pulsar-openfhe-backup-v1.3.2/` before replacement.
 OpenFHE uses recursive source discovery, so no handwritten CMake target patch
 is required. CMake must be reconfigured after installation to discover the
 new benchmark files.
@@ -114,7 +117,7 @@ cd ~/PULSAR-CPU
 python3 install_pulsar_openfhe.py ~/openfhe-development
 ```
 
-Configure and build the three executables:
+Configure and build the four executables:
 
 ```bash
 cd ~/openfhe-development
@@ -131,6 +134,7 @@ cmake --build build --target \
   benchmark-pulsar-single-round \
   benchmark-pulsar-multiply \
   benchmark-pulsar-add-chain \
+  benchmark-pulsar-vault \
   -j"$(nproc)"
 ```
 
@@ -139,7 +143,7 @@ small number of OpenFHE internals needed for `FLEXIBLEMANUAL` scaling and FHEZ
 metadata. Installing into another OpenFHE release is rejected instead of
 silently producing an incompatible build.
 
-## Single-instruction benchmarks
+## Instruction benchmarks
 
 Each script accepts the word width and CPU thread count:
 
@@ -149,6 +153,7 @@ cd ~/openfhe-development
 ./run_pulsar_gt.sh 128 12
 ./run_pulsar_eq.sh 128 12
 ./run_pulsar_xor.sh 128 12
+./run_pulsar_mixed.sh 128 12 1
 ./run_pulsar_mul.sh 128 12 1
 ```
 
@@ -156,14 +161,21 @@ Supported widths are `16`, `32`, `64`, `128`, and `256`. The generic Boolean
 operator interface is:
 
 ```bash
-./run_pulsar_cpu_operator.sh <add|gt|eq|xor> \
+./run_pulsar_cpu_operator.sh <add|gt|eq|xor|mixed> \
   <word_bits> <threads> [output_refresh]
 ```
 
 `output_refresh` defaults to `1`. The default measurement excludes setup and
-input refresh, evaluates the instruction once, and includes a shared output
-Boolean-to-Boolean refresh. Set the argument to `0` only to inspect the raw
-instruction circuit. Multiplication has a separate interface:
+input refresh, evaluates the requested benchmark once, and includes a shared
+output Boolean-to-Boolean refresh. Set the argument to `0` only to inspect the
+raw instruction circuit.
+
+For `mixed`, the benchmark evaluates `ADD(A,B)`, XORs the sum with a third
+operand, and compares the result with `A` using `GT`. Any intermediate refresh
+selected before `GT` and the requested output refresh are included in the
+reported latency.
+
+Multiplication has a separate interface:
 
 ```bash
 ./run_pulsar_mul.sh <word_bits> <threads> [repeats]
@@ -185,9 +197,23 @@ Application commands are:
 OMP_NUM_THREADS=12 ./run_pulsar_transfer.sh 128 0.01
 OMP_NUM_THREADS=12 ./run_pulsar_auction.sh 128 0.01
 ./run_pulsar_auction_16_256.sh 0.01
+./run_pulsar_vault.sh 256 3 3 12 1
 ./run_pulsar_sha256.sh 1 0.01 12
 ./run_pulsar_sha256.sh 64 0.01 12
 ```
+
+The Vault interface is
+
+```bash
+./run_pulsar_vault.sh \
+  <word_bits> <public_exchange_rate> <public_rate_scale> <threads> [repeats]
+```
+
+Vault evaluates
+`floor(((deposit * public_exchange_rate) mod 2^w) / public_rate_scale)`.
+The public rate scale must be nonzero. Both scalar instructions use the
+FHE-SIMD-ALU Boolean-to-Boolean refresh path, including the refresh between
+multiplication and division.
 
 The threshold argument controls profiling-based Bit Clean scheduling. Setup,
 key generation, encryption, input refresh, decryption, and correctness audits
@@ -199,7 +225,6 @@ operations selected during execution are included.
 Run checks that do not require an OpenFHE build:
 
 ```bash
-python3 verify_repository.py
 python3 tests/single_round_plain_test.py
 python3 tests/multiplier_plain_test.py
 python3 tests/sha256_plain_test.py

@@ -15,11 +15,13 @@ namespace lbcrypto {
 struct DenseRadixMultiplierTiming {
     double inputPack = 0.0;
     double convolution = 0.0;
-    double lazyCarry[3] = {0.0, 0.0, 0.0};
+    double lazyCarry[4] = {0.0, 0.0, 0.0, 0.0};
     double sharedFBT = 0.0;
     double prefix = 0.0;
     double correction = 0.0;
     double outputPack = 0.0;
+    double intermediateB2B = 0.0;
+    double addCorrection = 0.0;
     double finalB2B = 0.0;
     double setupExcluded = 0.0;
 
@@ -31,13 +33,19 @@ struct DenseRadixMultiplierLevels {
     uint32_t stableInput = 0;
     uint32_t packedRadix = 0;
     uint32_t convolution = 0;
-    uint32_t lazyCarry[3] = {0, 0, 0};
+    uint32_t lazyCarry[4] = {0, 0, 0, 0};
     uint32_t sharedFBTRaw = 0;
     uint32_t sharedFBT = 0;
     uint32_t prefix = 0;
     uint32_t correction = 0;
     uint32_t rawBoolean = 0;
+    uint32_t intermediateBoolean = 0;
     uint32_t finalBoolean = 0;
+};
+
+struct DenseRadixFullProduct {
+    CiphertextGroup low;
+    CiphertextGroup high;
 };
 
 // Exact OpenFHE port of the verified Lattigo Boolean/radix-16 multiplier.
@@ -52,6 +60,36 @@ public:
 
     CiphertextGroup EvalMultiply(CiphertextGroup left, CiphertextGroup right,
                                  uint32_t maximumB2BInputLevel);
+
+    DenseRadixFullProduct EvalFullMultiply(
+        CiphertextGroup left,
+        CiphertextGroup right,
+        uint32_t maximumB2BInputLevel);
+
+    // Public-constant counterpart of EvalMultiply. The scalar is supplied as
+    // little-endian radix-16 digits so the core remains independent of any
+    // application-side large-integer type. There are no scalar-specific fast
+    // paths: every value follows the same PolyCMult-compatible DFT pipeline.
+    CiphertextGroup EvalScaleMultiply(
+        CiphertextGroup input,
+        const std::vector<uint32_t>& multiplierDigits,
+        uint32_t maximumB2BInputLevel);
+
+    DenseRadixFullProduct EvalFullScaleMultiply(
+        CiphertextGroup input,
+        const std::vector<uint32_t>& multiplierDigits,
+        uint32_t maximumB2BInputLevel);
+
+    // Exact unsigned public division descriptor used by libdivide and by the
+    // validated Lattigo full-product implementation. An empty magic vector
+    // denotes the power-of-two descriptor; otherwise floor(X/d) is recovered
+    // from the high half of X*magic, with the optional add-marker correction.
+    CiphertextGroup EvalScaleDivide(
+        CiphertextGroup input,
+        const std::vector<uint32_t>& magicDigits,
+        uint32_t shift,
+        bool addMarker,
+        uint32_t maximumB2BInputLevel);
 
     using StageObserver = std::function<void(
         const std::string&, ConstCiphertext<DCRTPoly>)>;
@@ -73,6 +111,10 @@ public:
     // Extra rotations used by the two sparse linear maps, radix DFTs and
     // radix carry prefix. FHEZ bootstrap rotations are generated separately.
     static std::vector<int32_t> RotationIndices(uint32_t wordBits);
+    static std::vector<int32_t> ScaleDivisionRotationIndices(
+        uint32_t wordBits,
+        uint32_t shift,
+        bool addMarker);
 
     uint32_t WordBits() const { return wordBits; }
     uint32_t NativeBatch() const { return booleanBatch; }
@@ -85,8 +127,8 @@ public:
 private:
     static constexpr uint32_t kSlots = 32768;
     // Lattigo reports remaining levels while OpenFHE reports consumed levels.
-    // The multiplier is explicitly scheduled on levels 16..27. The context
-    // has two further levels used only by native B2B's pre-ModRaise C2R.
+    // The multiplier starts at level 16. The full-product FBT reaches level
+    // 18 because its delimiter consumes one level before the common tail.
     static constexpr uint32_t kCircuitInputLevel = 16;
     static constexpr uint32_t kSharedFBTOutputLevel = 18;
 
@@ -95,6 +137,8 @@ private:
     // a plan never retains BigCVector sources and never populates a runtime
     // (scale, modulus) cache.
     using LinearPlan = std::vector<Plaintext>;
+    using DiagonalFactory =
+        std::function<BigCVector(uint32_t logical, uint32_t output)>;
 
     Ciphertext<DCRTPoly> EvalLinearPlan(ConstCiphertext<DCRTPoly> input,
                                         LinearPlan& plan,
@@ -121,12 +165,39 @@ private:
         ConstCiphertext<DCRTPoly> input,
         LinearPlan& plan,
         const std::vector<Ciphertext<DCRTPoly>>& babyRotations);
+    std::vector<Ciphertext<DCRTPoly>> EvalStreamingBridgePlansRaw(
+        ConstCiphertext<DCRTPoly> input,
+        uint32_t outputCount,
+        const DiagonalFactory& factory);
+    Ciphertext<DCRTPoly> EvalStreamingLinearPlanRaw(
+        ConstCiphertext<DCRTPoly> input,
+        uint32_t logicalLength,
+        uint32_t stride,
+        const DiagonalFactory& factory);
+    Ciphertext<DCRTPoly> EvalStreamingInputPlanRaw(
+        ConstCiphertext<DCRTPoly> input,
+        uint32_t group);
+    std::vector<Ciphertext<DCRTPoly>> EvalStreamingOutputPlansRaw(
+        ConstCiphertext<DCRTPoly> input,
+        uint32_t residue,
+        uint32_t sourceStart);
+    Ciphertext<DCRTPoly> EvalStreamingDFTRaw(
+        ConstCiphertext<DCRTPoly> input,
+        bool inverseMasked,
+        bool packedFull);
     void PrepareInputPlans(CiphertextGroup input);
     Ciphertext<DCRTPoly> PackBooleanGroups(CiphertextGroup input);
     Ciphertext<DCRTPoly> ForwardDFT(ConstCiphertext<DCRTPoly> input);
     Ciphertext<DCRTPoly> InverseDFTMasked(ConstCiphertext<DCRTPoly> input);
+    Ciphertext<DCRTPoly> InverseDFTPackedFull(ConstCiphertext<DCRTPoly> input);
+    Plaintext EncodePublicFrequency(
+        const std::vector<uint32_t>& multiplierDigits,
+        ConstCiphertext<DCRTPoly> dftInput) const;
     Ciphertext<DCRTPoly> MultiplyReduce(ConstCiphertext<DCRTPoly> left,
                                         ConstCiphertext<DCRTPoly> right);
+    Ciphertext<DCRTPoly> MultiplyMaskReduce(
+        ConstCiphertext<DCRTPoly> input,
+        BigCVector mask);
     Ciphertext<DCRTPoly> Rotate(ConstCiphertext<DCRTPoly> input, int32_t offset);
     Ciphertext<DCRTPoly> Align(ConstCiphertext<DCRTPoly> input, uint32_t level);
     Ciphertext<DCRTPoly> AddAdjusted(ConstCiphertext<DCRTPoly> left,
@@ -136,19 +207,61 @@ private:
                                    ConstCiphertext<DCRTPoly> carryOut);
     Ciphertext<DCRTPoly> PrefixCarry(ConstCiphertext<DCRTPoly> propagate,
                                      ConstCiphertext<DCRTPoly> generate);
+    Ciphertext<DCRTPoly> PrefixCarryWide(ConstCiphertext<DCRTPoly> propagate,
+                                         ConstCiphertext<DCRTPoly> generate);
     std::vector<Ciphertext<DCRTPoly>> CorrectNibbles(
+        CiphertextGroup sixOutputs,
+        ConstCiphertext<DCRTPoly> carry);
+    std::vector<Ciphertext<DCRTPoly>> CorrectNibblesWide(
         CiphertextGroup sixOutputs,
         ConstCiphertext<DCRTPoly> carry);
     CiphertextGroup UnpackBooleanGroups(
         const std::vector<Ciphertext<DCRTPoly>>& planes);
+    CiphertextGroup FinalizeProduct(
+        Ciphertext<DCRTPoly> lazyDigits,
+        uint32_t maximumB2BInputLevel,
+        const BigFixedPoint& stableInputScale);
+    DenseRadixFullProduct FinalizeFullProduct(
+        Ciphertext<DCRTPoly> lazyDigits,
+        uint32_t maximumB2BInputLevel,
+        const BigFixedPoint& stableInputScale);
+    CiphertextGroup FinalizeDivisionProduct(
+        Ciphertext<DCRTPoly> lazyDigits,
+        CiphertextGroup stableInput,
+        uint32_t sourceStart,
+        uint32_t shift,
+        bool addMarker,
+        uint32_t maximumB2BInputLevel,
+        const BigFixedPoint& stableInputScale);
+    CiphertextGroup ExtractQuotient(
+        const std::vector<Ciphertext<DCRTPoly>>& planes,
+        uint32_t sourceStart);
+    CiphertextGroup DenseRightShift(CiphertextGroup input,
+                                    uint32_t shift);
+    Ciphertext<DCRTPoly> DenseAddAndShift(
+        ConstCiphertext<DCRTPoly> left,
+        ConstCiphertext<DCRTPoly> right,
+        uint32_t shift);
+    CiphertextGroup RefreshBooleanPair(
+        CiphertextGroup raw,
+        const BigFixedPoint& stableInputScale,
+        const char* label);
 
     LinearPlan BuildInputPlan(ConstCiphertext<DCRTPoly> input,
                               uint32_t group) const;
     LinearPlan BuildDFTPlan(ConstCiphertext<DCRTPoly> input,
                             bool inverseMasked) const;
+    LinearPlan BuildPackedFullInverseDFTPlan(
+        ConstCiphertext<DCRTPoly> input) const;
     LinearPlan BuildOutputPlan(ConstCiphertext<DCRTPoly> input,
                                uint32_t group,
                                uint32_t residue) const;
+    LinearPlan BuildQuotientOutputPlan(ConstCiphertext<DCRTPoly> input,
+                                       uint32_t group,
+                                       uint32_t residue,
+                                       uint32_t sourceStart) const;
+    LinearPlan BuildDenseShiftPlan(ConstCiphertext<DCRTPoly> input,
+                                   uint32_t shift) const;
     static Plaintext EncodeDiagonal(BigCVector diagonal,
                                     uint32_t babyIndex,
                                     uint32_t stride,
@@ -172,6 +285,7 @@ private:
     std::map<uint32_t, LinearPlan> inputPlans;
     LinearPlan forwardPlan;
     LinearPlan inversePlan;
+    LinearPlan packedFullInversePlan;
     std::map<uint32_t, LinearPlan> outputPlans;
     DenseRadixMultiplierTiming timing;
     DenseRadixMultiplierLevels levels;
