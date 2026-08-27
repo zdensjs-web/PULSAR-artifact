@@ -1,230 +1,138 @@
 # PULSAR-GPU
 
-PULSAR-GPU is the GPU implementation of the PULSAR fixed-width integer
-operators and application benchmarks. It evaluates Boolean-encoded encrypted
-integers with CKKS and uses
-[FIDESlib](https://github.com/CAPS-UMU/FIDESlib) as the CUDA backend. The
-implementation supports packed execution, complex-slot prefix computation,
-and multi-GPU execution.
-
-This repository is a research artifact. The current release contains the
-operator executables, the application drivers used by the GPU evaluation, and
-plaintext regression tests.
-
-## Operators
-
-PULSAR-GPU supports power-of-two word widths from 8 to 256 bits. The default width is 256 bits.
-
-| Group | Operation | Executable |
-|---|---|---|
-| Arithmetic | Addition | `pulsar_gpu_add` |
-| Arithmetic | Subtraction | `pulsar_gpu_sub` |
-| Arithmetic | Multiplication modulo `2^w` | `pulsar_gpu_mul` |
-| Arithmetic | Public-scalar multiplication modulo `2^256` | `pulsar_gpu_scalar_mul` |
-| Division | Public-scalar division | `pulsar_gpu_scalar_div` |
-| Division | Ciphertext-ciphertext division | `pulsar_gpu_div` |
-| Comparison | `GT`, `GE`, `LT`, `LE`, `EQ`, `NE` | `pulsar_gpu_gt`, `pulsar_gpu_ge`, `pulsar_gpu_lt`, `pulsar_gpu_le`, `pulsar_gpu_eq`, `pulsar_gpu_ne` |
-| Bitwise | `XOR`, `AND`, `OR`, `NOT` | `pulsar_gpu_xor`, `pulsar_gpu_and`, `pulsar_gpu_or`, `pulsar_gpu_not` |
-| Shift | Public left/right shift | `pulsar_gpu_scalar_shl`, `pulsar_gpu_scalar_shr` |
-| Shift | Encrypted left/right shift | `pulsar_gpu_shl`, `pulsar_gpu_shr` |
-
-Addition, subtraction, and comparison use a parallel-prefix circuit with
-complex packing. Bit positions are packed across CKKS slots to evaluate many
-integers in parallel. Arithmetic and comparison executables perform the final
-ciphertext refresh required by their standalone benchmark contract. `NOT`
-does not perform bootstrapping.
-
-## Applications
-
-The GPU application benchmarks operate on 128 packed 256-bit integers.
-
-| Application | Computation | Executable |
-|---|---|---|
-| Transfer | Conditional encrypted balance transfer | `pulsar_gpu_transfer` |
-| Auction | Maximum of 128 encrypted bids | `pulsar_gpu_auction` |
-| Confidential Vault | Public exchange-rate multiplication followed by public rate-scale division | `pulsar_gpu_vault` |
-
-The Transfer executable contains the White Paper, No CMUX, and Overflow
-implementations used in the evaluation. The Vault output is
-`floor(((deposit * exchangeRate) mod 2^256) / rateScale)`.
+This package contains the PULSAR GPU operators and the modified FIDESlib
+source required to build them. PULSAR represents fixed-width integers as
+Boolean CKKS slots and uses a ring dimension of `2^17`.
 
 ## Requirements
 
-- Linux with an NVIDIA CUDA-capable GPU
-- NVIDIA CUDA 12 or 13
-- GCC 11 or later
-- CMake 3.25.2 or later
-- OpenMP development files
-- [FIDESlib](https://github.com/CAPS-UMU/FIDESlib) and the FIDESlib-compatible patched OpenFHE build
-- NCCL for multi-GPU execution when enabled in FIDESlib
+- Linux x86-64
+- NVIDIA GPU with CUDA 12 or newer
+- GCC/G++ 11 or newer
+- CMake 3.25.2 or newer
+- Git and GNU Make
+- Internet access while installing OpenFHE
+- NCCL is optional and enables FIDESlib multi-GPU support when installed
 
-The known-good environment uses the patched FIDESlib/OpenFHE tree used during PULSAR-GPU development. Compatibility with an unmodified upstream FIDESlib checkout is not guaranteed when the upstream API changes.
+The tested environment is Ubuntu 22.04 with an NVIDIA A100, CUDA 12.4,
+GCC 11.4, and CMake 3.31.1.
 
-## Install FIDESlib
-
-Follow the [official FIDESlib installation instructions](https://github.com/CAPS-UMU/FIDESlib). A typical user-local installation is:
+On Ubuntu, the non-CUDA build tools can be installed with:
 
 ```bash
-git clone https://github.com/CAPS-UMU/FIDESlib.git
-cmake -S FIDESlib -B FIDESlib/build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFIDESLIB_INSTALL_OPENFHE=ON \
-  -DFIDESLIB_INSTALL_PREFIX="$HOME/.local" \
-  -DOPENFHE_INSTALL_PREFIX="$HOME/.local"
-cmake --build FIDESlib/build -j"$(nproc)"
-cmake --build FIDESlib/build --target install -j"$(nproc)"
+sudo apt install -y build-essential git
 ```
 
-CUDA installation and GPU architecture selection depend on the host system. Consult the FIDESlib documentation before changing its CMake options.
+CUDA must be installed separately and available at `/usr/local/cuda`. Set
+`CUDA_HOME` before installation when CUDA is installed elsewhere.
 
-## Build PULSAR-GPU
+## Install
 
-Clone the repository and point CMake to the FIDESlib installation prefix:
+From the extracted `PULSAR-GPU` directory, run:
 
 ```bash
-git clone <PULSAR-GPU repository URL>
-cd PULSAR-GPU
-
-cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="$HOME/.local"
-cmake --build build -j"$(nproc)"
+chmod +x install_gpu.sh env.sh
+JOBS=24 ./install_gpu.sh
 ```
 
-All executables are written to `build/bin`. Individual targets can be built
-separately:
+The script performs the complete build:
+
+1. clones the pinned OpenFHE `v1.5.1` source;
+2. applies the included PULSAR OpenFHE patch;
+3. builds and installs OpenFHE;
+4. builds the bundled PULSAR-modified FIDESlib; and
+5. builds and installs all PULSAR-GPU operators and applications.
+
+Sources remain unchanged. Downloaded dependencies and build files are stored
+in `.build`, while installed headers, libraries, and executables are stored
+in `.local`. Both directories are local to this artifact.
+
+The script detects the compute capabilities reported by `nvidia-smi`. To set
+the target explicitly, use, for example:
 
 ```bash
-cmake --build build --target pulsar_gpu_add -j"$(nproc)"
-cmake --build build --target pulsar_gpu_transfer -j"$(nproc)"
+FIDESLIB_ARCH=80-real JOBS=24 ./install_gpu.sh
 ```
 
-Optional installation:
+When the default `cmake` is older than 3.25.2, specify a newer executable:
 
 ```bash
-cmake --install build --prefix "$HOME/.local"
+CMAKE_BIN=/opt/cmake-3.31.1/bin/cmake JOBS=24 ./install_gpu.sh
 ```
 
 ## Run
 
-The operators built on the common runtime interface accept `--help`. Their
-common options are:
-
-- `--bits N`: word width, one of `8`, `16`, `32`, `64`, `128`, or `256`
-- `--words N`: number of packed words per ciphertext
-- `--gpus N`: use logical GPU indices `0` through `N-1`
-- `--devices LIST`: select logical GPU indices explicitly
-
-`CUDA_VISIBLE_DEVICES` selects the physical devices visible to the process. `--gpus` and `--devices` select logical indices within that visible set.
-
-### Addition
+Load the installed environment and run an operator directly. For example,
+the following command executes 256-bit addition on one GPU:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./build/bin/pulsar_gpu_add --bits 256 --gpus 2
+source ./env.sh
+CUDA_VISIBLE_DEVICES=0 pulsar_gpu_add --bits 256 --gpus 1
 ```
 
-### Comparison
+Every executable accepts `--help`. Installed operators are:
 
-```bash
-CUDA_VISIBLE_DEVICES=0 \
-./build/bin/pulsar_gpu_gt --bits 128 --gpus 1
-```
-
-### Multiplication
-
-The multiplier also accepts `--merge-batch N`, which controls the number of row merges performed between GPU synchronization points.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./build/bin/pulsar_gpu_mul --bits 256 --gpus 2 --merge-batch 8
-```
-
-### Public-scalar multiplication
-
-The argument is a decimal or hexadecimal public 256-bit scalar. This
-benchmark uses two logical GPUs.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./build/bin/pulsar_gpu_scalar_mul 7
-```
-
-### Ciphertext-ciphertext division
-
-The divider also accepts `--parallel-blocks N`.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-./build/bin/pulsar_gpu_div --bits 256 --gpus 2 --parallel-blocks 2
-```
-
-For these operators, use `--help` as the authoritative description of
-supported options and defaults.
+- `pulsar_gpu_add`, `pulsar_gpu_sub`, and `pulsar_gpu_mul`
+- `pulsar_gpu_scalar_mul`, `pulsar_gpu_div`, and `pulsar_gpu_scalar_div`
+- `pulsar_gpu_gt`, `pulsar_gpu_ge`, `pulsar_gpu_lt`, `pulsar_gpu_le`,
+  `pulsar_gpu_eq`, and `pulsar_gpu_ne`
+- `pulsar_gpu_and`, `pulsar_gpu_or`, `pulsar_gpu_xor`, and `pulsar_gpu_not`
+- `pulsar_gpu_shl`, `pulsar_gpu_shr`, `pulsar_gpu_scalar_shl`, and
+  `pulsar_gpu_scalar_shr`
 
 ## Run Applications
 
-The following commands reproduce the application entry points. Auction and
-Vault use three logical GPUs. Transfer uses every device exposed through
-`CUDA_VISIBLE_DEVICES`.
-
-### Transfer
+After installation, load the environment once:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 \
-./build/bin/pulsar_gpu_transfer all
+source ./env.sh
 ```
 
-Replace `all` with `whitepaper`, `no_cmux`, or `overflow` to run one Transfer
-implementation.
+The five application workloads used in the evaluation are invoked as follows.
+Transfer uses all GPUs exposed by `CUDA_VISIBLE_DEVICES`; Auction and Vault
+require three visible GPUs.
+
+### Transfer (White Paper)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 pulsar_gpu_transfer whitepaper
+```
+
+### Transfer (No CMUX)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 pulsar_gpu_transfer no_cmux
+```
+
+### Transfer (Overflow)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 pulsar_gpu_transfer overflow
+```
+
+All three Transfer workloads can alternatively be run consecutively with
+`pulsar_gpu_transfer all`.
 
 ### Auction
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 \
-./build/bin/pulsar_gpu_auction
+CUDA_VISIBLE_DEVICES=0,1,2 pulsar_gpu_auction
 ```
 
 ### Confidential Vault
 
-The two arguments are the public exchange rate and nonzero public rate scale.
+The arguments are the public exchange rate and the nonzero public rate scale.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 \
-./build/bin/pulsar_gpu_vault 3 3
+CUDA_VISIBLE_DEVICES=0,1,2 pulsar_gpu_vault 3 3
 ```
 
-Setup, key generation, encryption, and decryption are reported separately
-from the online application latency. Each application decrypts its outputs and
-checks them against a plaintext reference after evaluation.
+## Layout
 
-## Verification
-
-The repository includes tests for the plaintext algebra, packing rules, and level schedules. These tests do not require a GPU build:
-
-```bash
-python3 tests/subtractor_head_zero_plain_test.py
-python3 tests/comparison_head_zero_plain_test.py
-python3 tests/word_operator_plain_test.py
-python3 tests/multiplier_plain_test.py
-python3 tests/scalar_divider_plain_test.py
-python3 tests/cipher_divider_plain_test.py
-python3 tests/cipher_divider_level_schedule_test.py
-```
-
-Full ciphertext correctness and timing must be verified on a machine with the
-matching FIDESlib/OpenFHE build and NVIDIA GPUs.
-
-## Repository Structure
-
-```text
-PULSAR-GPU/
-|-- CMakeLists.txt
-|-- README.md
-|-- src/                  # Operators, applications, and shared runtime code
-`-- tests/                # Plaintext algebra and schedule regression tests
-```
-
-## Acknowledgments
-
-PULSAR-GPU builds on [FIDESlib](https://github.com/CAPS-UMU/FIDESlib), a CUDA CKKS backend interoperable with [OpenFHE](https://github.com/openfheorg/openfhe-development).
+- `src`: PULSAR-GPU operator and application implementations
+- `third_party/FIDESlib`: modified FIDESlib source required by PULSAR
+- `patches`: provenance patch for FIDESlib and build patch for OpenFHE
+- `tests`: plaintext correctness tests
+- `install_gpu.sh`: complete source installation
+- `env.sh`: runtime environment
+Exact dependency revisions are recorded in `DEPENDENCIES.md`.

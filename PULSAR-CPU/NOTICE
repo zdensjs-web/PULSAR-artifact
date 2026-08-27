@@ -13,3 +13,8 @@ operators or scheduler are part of OpenFHE or FHE-SIMD-ALU.
 PULSAR-specific components include the dense Boolean representation, complex
 parallel-prefix operators, Prefix Boot integration, circuit-oriented refresh
 scheduler, multiplication path, and application benchmarks.
+
+The offline build bundle also contains pinned source releases of Intel HEXL,
+Google cpu_features, cereal, and gperftools. Their upstream license and
+attribution files are retained in the corresponding source archives under
+vendor/.

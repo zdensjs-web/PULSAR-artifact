@@ -1,0 +1,1559 @@
+diff --git a/api/CCParams.cpp b/api/CCParams.cpp
+index 95b0077..086ca0f 100644
+--- a/api/CCParams.cpp
++++ b/api/CCParams.cpp
+@@ -29,6 +29,13 @@ void CCParams<CryptoContextCKKSRNS>::SetBatchSize(uint32_t size) {
+ 	params.SetBatchSize(size);
+ }
+ 
++void CCParams<CryptoContextCKKSRNS>::SetCKKSDataType(CKKSDataType dataType) {
++	auto& params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(cpu);
++	auto data_type_openfhe = static_cast<lbcrypto::CKKSDataType>(dataType);
++	assert(static_cast<int>(data_type_openfhe) == static_cast<int>(dataType));
++	params.SetCKKSDataType(data_type_openfhe);
++}
++
+ void CCParams<CryptoContextCKKSRNS>::SetRingDim(uint32_t dim) {
+ 	auto& params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(cpu);
+ 	params.SetRingDim(dim);
+diff --git a/api/CCParams.hpp b/api/CCParams.hpp
+index 55e5c02..d23516e 100644
+--- a/api/CCParams.hpp
++++ b/api/CCParams.hpp
+@@ -35,6 +35,7 @@ template <> class CCParams<CryptoContextCKKSRNS> {
+ 	void SetMultiplicativeDepth(uint32_t depth);
+ 	void SetScalingModSize(uint32_t size);
+ 	void SetBatchSize(uint32_t size);
++	void SetCKKSDataType(CKKSDataType dataType);
+ 	void SetRingDim(uint32_t dim);
+ 	void SetScalingTechnique(ScalingTechnique tech);
+ 	void SetNumLargeDigits(uint32_t numDigits);
+diff --git a/api/CryptoContext.cpp b/api/CryptoContext.cpp
+index f474f5b..7075a81 100644
+--- a/api/CryptoContext.cpp
++++ b/api/CryptoContext.cpp
+@@ -20,10 +20,14 @@
+ #include "lattice/hal/lat-backend.h"
+ 
+ #include <any>
++#include <chrono>
++#include <cstdlib>
++#include <iomanip>
+ #include <cmath>
+ #include <complex>
+ #include <cstdint>
+ #include <functional>
++#include <iostream>
+ #include <openfhe.h>
+ // Serialization headers - required for cereal type registration.
+ #include <ciphertext-ser.h>
+@@ -240,6 +244,33 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
+ 		FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slot, c);
+ 	}
+ 
++
++	// FIDES_TWISTED_PRODUCT_V1: transfer mixed-basis switching keys to GPU.
++	using TwistedCpuKey =
++	  std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>;
++	for (auto& [index, pair] : this->twisted_product_eval_keys) {
++		{
++			auto& t_cpu = std::any_cast<TwistedCpuKey&>(pair.first);
++			auto& st_cpu = std::any_cast<TwistedCpuKey&>(pair.second);
++			FIDESlib::CKKS::KeySwitchingKey t_gpu(c);
++			FIDESlib::CKKS::KeySwitchingKey st_gpu(c);
++			auto t_raw = FIDESlib::CKKS::GetKeySwitchKey(t_cpu);
++			auto st_raw = FIDESlib::CKKS::GetKeySwitchKey(st_cpu);
++			t_gpu.Initialize(t_raw);
++			st_gpu.Initialize(st_raw);
++			c->AddTwistedProductKeys(
++			  index, std::move(t_gpu), std::move(st_gpu));
++		}
++		std::cout << "Twisted product key pair loaded: index="
++		          << index << std::endl;
++
++		// GPU execution no longer needs the OpenFHE copies.  Release each pair
++		// immediately so CPU and GPU representations do not accumulate across
++		// all prefix distances during LoadContext.
++		pair.first.reset();
++		pair.second.reset();
++	}
++	this->twisted_product_eval_keys.clear();
+ 	this->gpu	 = std::make_any<FIDESlib::CKKS::Context>(std::move(c));
+ 	this->loaded = true;
+ }
+@@ -325,6 +356,247 @@ void CryptoContextImpl<DCRTPoly>::EvalRotateKeyGen(const PrivateKey<DCRTPoly>& s
+ 	this->rotation_indexes.insert(this->rotation_indexes.end(), steps.begin(), steps.end());
+ }
+ 
++
++// FIDES_TWISTED_PRODUCT_V1
++void CryptoContextImpl<DCRTPoly>::EvalTwistedProductKeyGen(
++  const PrivateKey<DCRTPoly>& sk,
++  const std::vector<int32_t>& steps,
++  uint32_t slots) {
++	FIDESlib::CudaNvtxRange range("API_TwistedProductKeyGen");
++	if (!this->devices.empty() && this->loaded)
++		OPENFHE_THROW("EvalTwistedProductKeyGen must be called before LoadContext");
++
++	auto& context =
++	  std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
++	auto& sk_impl =
++	  std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
++	const uint32_t n = context->GetRingDimension();
++	const uint32_t m = 2 * n;
++
++	// FIDES_CPU_TWISTED_V1: complex conjugation is sigma_{2N-1}.
++	// The GPU bootstrap path already owns a conjugation key; retaining another
++	// full OpenFHE key there can push the large context over its memory limit.
++	if (this->devices.empty())
++		context->EvalAutomorphismKeyGen(sk_impl, {m - 1});
++
++	if (slots == 0)
++		slots = n / 2;
++	if (slots == 0 || slots > n / 2 || (n / 2) % slots != 0)
++		OPENFHE_THROW("invalid slot count for twisted-product keys");
++
++	using TwistedCpuKey =
++	  std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>;
++	const auto& s = sk_impl->GetPrivateElement();
++	for (int32_t requested : steps) {
++		int32_t index = requested % static_cast<int32_t>(slots);
++		if (index < 0)
++			index += static_cast<int32_t>(slots);
++		if (index > static_cast<int32_t>(slots / 2))
++			index += static_cast<int32_t>(n / 2 - slots);
++		if (index == 0)
++			continue;
++
++		// RNSPoly passes x^{-1} to its GPU pullback permutation, while the
++		// resulting mathematical automorphism is sigma_x.  Therefore the raw
++		// transformed ciphertext decrypts under t=sigma_x(s), x=5^index.
++		const uint32_t auto_index = static_cast<uint32_t>(
++		  FIDESlib::modpow(5, index, m));
++		std::vector<uint32_t> automorphism_map(n);
++		lbcrypto::PrecomputeAutoMap(n, auto_index, &automorphism_map);
++		auto t = s.AutomorphismTransform(auto_index, automorphism_map);
++		auto st = s * t;
++
++		auto sk_t =
++		  std::make_shared<lbcrypto::PrivateKeyImpl<lbcrypto::DCRTPoly>>(context);
++		auto sk_st =
++		  std::make_shared<lbcrypto::PrivateKeyImpl<lbcrypto::DCRTPoly>>(context);
++		sk_t->SetPrivateElement(std::move(t));
++		sk_st->SetPrivateElement(std::move(st));
++		sk_t->SetKeyTag(sk_impl->GetKeyTag());
++		sk_st->SetKeyTag(sk_impl->GetKeyTag());
++
++		auto t_to_s = std::dynamic_pointer_cast<
++		  lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
++		  context->GetScheme()->KeySwitchGen(sk_t, sk_impl));
++		auto st_to_s = std::dynamic_pointer_cast<
++		  lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
++		  context->GetScheme()->KeySwitchGen(sk_st, sk_impl));
++		if (!t_to_s || !st_to_s)
++			OPENFHE_THROW("failed to create twisted-product switching keys");
++
++		this->twisted_product_eval_keys[index] = {
++		  std::make_any<TwistedCpuKey>(std::move(t_to_s)),
++		  std::make_any<TwistedCpuKey>(std::move(st_to_s)) };
++	}
++}
++
++
++
++
++
++// FIDES_DERIVED_TWISTED_KEYS_V2
++void CryptoContextImpl<DCRTPoly>::EvalDerivedTwistedProductKeyGen(
++  const PublicKey<DCRTPoly>& publicKey,
++  const std::vector<int32_t>& steps,
++  uint32_t slots) {
++	FIDESlib::CudaNvtxRange range("API_DerivedTwistedProductKeyGen");
++	if (!this->devices.empty() && this->loaded)
++		OPENFHE_THROW(
++		  "EvalDerivedTwistedProductKeyGen must be called before LoadContext");
++
++	auto& context =
++	  std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
++	const auto& pk_impl =
++	  std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(
++	    publicKey->pimpl);
++	const std::string key_tag = pk_impl->GetKeyTag();
++	const uint32_t n = context->GetRingDimension();
++	const uint32_t m = 2 * n;
++
++	if (slots == 0)
++		slots = n / 2;
++	if (slots == 0 || slots > n / 2 || (n / 2) % slots != 0)
++		OPENFHE_THROW("invalid slot count for derived twisted-product keys");
++
++	const auto& relin_keys =
++	  lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::
++	    GetEvalMultKeyVector(key_tag);
++	if (relin_keys.empty())
++		OPENFHE_THROW(
++		  "standard EvalMultKeyGen must precede derived twisted key generation");
++	auto relin_key = std::dynamic_pointer_cast<
++	  lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(relin_keys.front());
++	if (!relin_key)
++		OPENFHE_THROW("standard relinearization key has an unexpected type");
++
++	auto& rotation_keys =
++	  lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::
++	    GetEvalAutomorphismKeyMap(key_tag);
++	using TwistedCpuKey =
++	  std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>;
++
++	auto make_eval_key =
++	  [&](std::vector<lbcrypto::DCRTPoly>&& a,
++	      std::vector<lbcrypto::DCRTPoly>&& b) -> TwistedCpuKey {
++		auto key = std::make_shared<
++		  lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(context);
++		key->SetAVector(std::move(a));
++		key->SetBVector(std::move(b));
++		key->SetKeyTag(key_tag);
++		return key;
++	  };
++
++	for (int32_t requested : steps) {
++		int32_t index = requested % static_cast<int32_t>(slots);
++		if (index < 0)
++			index += static_cast<int32_t>(slots);
++		if (index > static_cast<int32_t>(slots / 2))
++			index += static_cast<int32_t>(n / 2 - slots);
++		if (index == 0)
++			continue;
++
++		const uint32_t auto_index = static_cast<uint32_t>(
++		  FIDESlib::modpow(5, index, m));
++		const uint32_t standard_auto_index =
++		  context->FindAutomorphismIndex(
++		    static_cast<uint32_t>(requested));
++		if (standard_auto_index != auto_index)
++			OPENFHE_THROW(
++			  "rotation-key automorphism does not match the twisted-product "
++			  "normalization");
++
++		auto rotation_it = rotation_keys.find(auto_index);
++		if (rotation_it == rotation_keys.end())
++			OPENFHE_THROW(
++			  "missing standard rotation key for derived twisted index " +
++			  std::to_string(index));
++		auto rotation_key = std::dynamic_pointer_cast<
++		  lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
++		    rotation_it->second);
++		if (!rotation_key)
++			OPENFHE_THROW("standard rotation key has an unexpected type");
++
++		std::vector<uint32_t> automorphism_map(n);
++		lbcrypto::PrecomputeAutoMap(
++		  n, auto_index, &automorphism_map);
++
++		// The standard rotation key switches s to sigma_d^{-1}(s), after
++		// which OpenFHE applies sigma_d.  Applying sigma_d publicly to every
++		// key polynomial therefore gives a direct sigma_d(s) -> s key.
++		std::vector<lbcrypto::DCRTPoly> t_a;
++		std::vector<lbcrypto::DCRTPoly> t_b;
++		t_a.reserve(rotation_key->GetAVector().size());
++		t_b.reserve(rotation_key->GetBVector().size());
++		for (const auto& value : rotation_key->GetAVector()) {
++			t_a.emplace_back(
++			  value.AutomorphismTransform(
++			    auto_index, automorphism_map));
++		}
++		for (const auto& value : rotation_key->GetBVector()) {
++			t_b.emplace_back(
++			  value.AutomorphismTransform(
++			    auto_index, automorphism_map));
++		}
++		auto t_to_s =
++		  make_eval_key(std::move(t_a), std::move(t_b));
++
++		// Public derivation of the s*sigma_d(s) -> s key:
++		//   1. ModDown a t->s key entry to obtain Enc_s(T_j(t)) in Q.
++		//   2. Formally multiply its phase by s: (b,a) -> (0,b,a).
++		//   3. Extend the linear base (0,b) to P*(0,b) in QP.
++		//   4. Apply the standard s^2->s key with the extended key-switch
++		//      core to a, and accumulate that QP result into the base.
++		// This order is essential: relinearizing down to Q and then lifting
++		// would multiply the relinearization noise by P.
++		std::vector<lbcrypto::DCRTPoly> st_a;
++		std::vector<lbcrypto::DCRTPoly> st_b;
++		st_a.reserve(t_to_s->GetAVector().size());
++		st_b.reserve(t_to_s->GetBVector().size());
++		for (size_t part = 0; part < t_to_s->GetAVector().size();
++		     ++part) {
++			auto entry = std::make_shared<
++			  lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(
++			    context, key_tag);
++			entry->SetElements({
++			  t_to_s->GetBVector().at(part),
++			  t_to_s->GetAVector().at(part) });
++
++			auto down = context->KeySwitchDown(entry);
++			auto zero = down->GetElements().at(0);
++			zero.SetValuesToZero();
++			auto linear_base = down->CloneEmpty();
++			linear_base->SetElements({
++			  std::move(zero), down->GetElements().at(0) });
++			auto extended = context->KeySwitchExt(linear_base, true);
++
++			const auto& quadratic = down->GetElements().at(1);
++			auto scheme = context->GetScheme();
++			auto digits = scheme->EvalKeySwitchPrecomputeCore(
++			  quadratic, relin_key->GetCryptoParameters());
++			auto switched = scheme->EvalFastKeySwitchCoreExt(
++			  digits, relin_key, quadratic.GetParams());
++			auto& extended_elements = extended->GetElements();
++			extended_elements.at(0) += switched->at(0);
++			extended_elements.at(1) += switched->at(1);
++			if (extended->GetElements().size() != 2)
++				OPENFHE_THROW(
++				  "derived extended key entry is not two-component");
++			st_b.emplace_back(extended->GetElements().at(0));
++			st_a.emplace_back(extended->GetElements().at(1));
++		}
++		auto st_to_s =
++		  make_eval_key(std::move(st_a), std::move(st_b));
++
++		this->twisted_product_eval_keys[index] = {
++		  std::make_any<TwistedCpuKey>(std::move(t_to_s)),
++		  std::make_any<TwistedCpuKey>(std::move(st_to_s)) };
++		std::cout
++		  << "Publicly derived twisted key pair: index=" << index
++		  << " source=rotation+relinearization" << std::endl;
++	}
++}
++
++
+ // ---- Bootstrapping ----
+ 
+ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>& levelBudget, std::vector<uint32_t> dim1, uint32_t slots, uint32_t correctionFactor, bool precompute, bool btsfirstboot) {
+@@ -372,6 +644,13 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>
+ 
+ 	this->slots_bootstrap.push_back(slots);
+ 
++	// FIDES_CPU_BOOTSTRAP_KEYS_V1: native CPU Bootstrap uses OpenFHE keys.
++	if (this->devices.empty()) {
++		auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
++		context->EvalBootstrapKeyGen(skImpl, slots);
++		return;
++	}
++
+ 	FIDESlib::CKKS::GenBootstrapKeys(skImpl, slots, this->keyDist == fideslib::SPARSE_ENCAPSULATED);
+ }
+ 
+@@ -1191,7 +1470,9 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRT
+ 
+ 		auto& context					= std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+ 		auto& ct1Impl					= std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct1->cpu);
+-		auto& ptImpl					= std::any_cast<const lbcrypto::ConstPlaintext&>(pt->cpu);
++		const auto& mutablePt =
++		  std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
++		lbcrypto::ConstPlaintext ptImpl = mutablePt;
+ 		auto ct							= context->EvalMult(ct1Impl, ptImpl);
+ 		Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+ 		ciphertext->cpu					= std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(ct);
+@@ -1252,7 +1533,9 @@ void CryptoContextImpl<DCRTPoly>::EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Pla
+ 		auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+ 		EnsureMutableCpuCiphertext(ct1);
+ 		auto& ct1Impl = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct1->cpu);
+-		auto& ptImpl  = std::any_cast<const lbcrypto::ConstPlaintext&>(pt->cpu);
++		const auto& mutablePt =
++		  std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
++		lbcrypto::ConstPlaintext ptImpl = mutablePt;
+ 		auto res	  = context->EvalMult(ct1Impl, ptImpl);
+ 		ct1->cpu	  = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(res);
+ 		return;
+@@ -1377,6 +1660,233 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSquareMutable(Ciphertext<D
+ 	return EvalSquare(ct);
+ }
+ 
++
++Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalRotateThenMultControl(
++    const Ciphertext<DCRTPoly>& lhs,
++    const Ciphertext<DCRTPoly>& rhs,
++    int32_t index) {
++    FIDESlib::CudaNvtxRange r("API_rotate_then_mult_control");
++
++    if (this->devices.empty()) {
++        auto& context =
++            std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(
++                this->cpu);
++        auto& lhsImpl =
++            std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(
++                lhs->cpu);
++        auto& rhsImpl =
++            std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(
++                rhs->cpu);
++        auto rotated = context->EvalRotate(rhsImpl, index);
++        auto product = context->EvalMult(lhsImpl, rotated);
++        Ciphertext<DCRTPoly> result =
++            std::make_shared<CiphertextImpl<DCRTPoly>>(
++                this->self_reference.lock());
++        result->cpu =
++            std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(product);
++        return result;
++    }
++
++    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(lhs));
++    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(rhs));
++
++    // Clone one operand instead of materializing both the rotated temporary
++    // and EvalMult's output clone.  The lower operations are deliberately
++    // unchanged so this remains a valid control, not the proposed fusion.
++    Ciphertext<DCRTPoly> result =
++        std::make_shared<CiphertextImpl<DCRTPoly>>(*rhs);
++    auto resultGpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++        this->GetDeviceCiphertext(result->gpu));
++    auto lhsGpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++        this->GetDeviceCiphertext(lhs->gpu));
++    resultGpu->rotate(index);
++    resultGpu->mult(*lhsGpu);
++    return result;
++}
++
++
++
++// FIDES_AFFINE_SKEW_SQUARE_V1
++std::pair<Ciphertext<DCRTPoly>, Ciphertext<DCRTPoly>>
++CryptoContextImpl<DCRTPoly>::EvalAffineSkewSquare(
++  const Ciphertext<DCRTPoly>& propagate,
++  const Ciphertext<DCRTPoly>& generate,
++  int32_t index,
++  bool produceP) {
++	FIDESlib::CudaNvtxRange range("API_AffineSkewSquareRank2");
++	if (this->devices.empty())
++		OPENFHE_THROW("EvalAffineSkewSquare is implemented only for the GPU path");
++	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(propagate));
++	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(generate));
++
++	Ciphertext<DCRTPoly> out_g =
++	  std::make_shared<CiphertextImpl<DCRTPoly>>(*generate);
++	Ciphertext<DCRTPoly> out_p;
++	if (produceP)
++		out_p = std::make_shared<CiphertextImpl<DCRTPoly>>(*propagate);
++
++	auto p_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(propagate->gpu));
++	auto g_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(generate->gpu));
++	auto out_g_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(out_g->gpu));
++	FIDESlib::CKKS::Ciphertext* out_p_gpu = nullptr;
++	if (produceP) {
++		out_p_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++		  this->GetDeviceCiphertext(out_p->gpu)).get();
++	}
++
++	p_gpu->affineSkewSquare(*g_gpu, *out_g_gpu, out_p_gpu, index);
++	return {out_g, out_p};
++}
++
++// FIDES_TWISTED_PRODUCT_V1
++Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalTwistedProduct(
++  const Ciphertext<DCRTPoly>& lhs,
++  const Ciphertext<DCRTPoly>& rhs,
++  int32_t index) {
++	FIDESlib::CudaNvtxRange range("API_TwistedProduct");
++	if (this->devices.empty()) {
++		// FIDES_CPU_TWISTED_V1
++		using CpuCiphertext =
++		  lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
++		using TwistedCpuKey =
++		  std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>;
++
++		auto& context = std::any_cast<
++		  const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
++		const auto& lhs_const =
++		  std::any_cast<const CpuCiphertext&>(lhs->cpu);
++		const auto& rhs_const =
++		  std::any_cast<const CpuCiphertext&>(rhs->cpu);
++		if (lhs_const->NumberCiphertextElements() != 2 ||
++		    rhs_const->NumberCiphertextElements() != 2) {
++			OPENFHE_THROW(
++			  "EvalTwistedProduct requires two-component ciphertexts");
++		}
++
++		// Match OpenFHE EvalMult under FIXEDMANUAL/FLEXIBLEAUTO exactly:
++		// align levels and make both inputs scale-degree one before forming
++		// the bilinear tensor.
++		auto lhs_cpu = lhs_const->Clone();
++		auto rhs_cpu = rhs_const->Clone();
++		const auto crypto_params = std::dynamic_pointer_cast<
++		  lbcrypto::CryptoParametersRNS>(lhs_cpu->GetCryptoParameters());
++		if (!crypto_params)
++			OPENFHE_THROW("EvalTwistedProduct requires RNS parameters");
++		const auto scaling = crypto_params->GetScalingTechnique();
++		if (scaling == lbcrypto::FIXEDMANUAL) {
++			context->GetScheme()->AdjustLevelsInPlace(lhs_cpu, rhs_cpu);
++		}
++		else if (scaling != lbcrypto::NORESCALE) {
++			context->GetScheme()->AdjustLevelsAndDepthToOneInPlace(
++			  lhs_cpu, rhs_cpu);
++		}
++
++		const uint32_t n = context->GetRingDimension();
++		const uint32_t m = 2 * n;
++		uint32_t slots = rhs_cpu->GetSlots();
++		if (slots == 0)
++			slots = n / 2;
++		if (slots == 0 || slots > n / 2 || (n / 2) % slots != 0)
++			OPENFHE_THROW("invalid slot count in EvalTwistedProduct");
++
++		int32_t normalized =
++		  index % static_cast<int32_t>(slots);
++		if (normalized < 0)
++			normalized += static_cast<int32_t>(slots);
++		if (normalized > static_cast<int32_t>(slots / 2))
++			normalized += static_cast<int32_t>(n / 2 - slots);
++		if (normalized == 0)
++			OPENFHE_THROW(
++			  "EvalTwistedProduct requires a nonzero automorphism");
++
++		auto key_it = this->twisted_product_eval_keys.find(normalized);
++		if (key_it == this->twisted_product_eval_keys.end())
++			OPENFHE_THROW(
++			  "missing mixed-basis keys for twisted-product index " +
++			  std::to_string(normalized));
++		const auto& t_to_s =
++		  std::any_cast<const TwistedCpuKey&>(key_it->second.first);
++		const auto& st_to_s =
++		  std::any_cast<const TwistedCpuKey&>(key_it->second.second);
++
++		const uint32_t auto_index = static_cast<uint32_t>(
++		  FIDESlib::modpow(5, normalized, m));
++		std::vector<uint32_t> automorphism_map(n);
++		lbcrypto::PrecomputeAutoMap(
++		  n, auto_index, &automorphism_map);
++
++		const auto& a = lhs_cpu->GetElements();
++		const auto& b = rhs_cpu->GetElements();
++		auto sigma_b0 =
++		  b[0].AutomorphismTransform(auto_index, automorphism_map);
++		auto sigma_b1 =
++		  b[1].AutomorphismTransform(auto_index, automorphism_map);
++
++		// The raw product decrypts in the mixed basis {1,s,t,s*t}.
++		// Keep all four directions separate until the two KSK products have
++		// been accumulated in QP.
++		auto d00 = a[0] * sigma_b0;
++		auto ds = a[1] * sigma_b0;
++		auto dt = a[0] * sigma_b1;
++		auto dst = a[1] * sigma_b1;
++
++		auto scheme = context->GetScheme();
++		auto dt_digits = scheme->EvalKeySwitchPrecomputeCore(
++		  dt, t_to_s->GetCryptoParameters());
++		auto dst_digits = scheme->EvalKeySwitchPrecomputeCore(
++		  dst, st_to_s->GetCryptoParameters());
++		auto dt_qp = scheme->EvalFastKeySwitchCoreExt(
++		  dt_digits, t_to_s, dt.GetParams());
++		auto dst_qp = scheme->EvalFastKeySwitchCoreExt(
++		  dst_digits, st_to_s, dst.GetParams());
++
++		auto base = lhs_cpu->CloneEmpty();
++		std::vector<lbcrypto::DCRTPoly> base_elements;
++		base_elements.reserve(2);
++		base_elements.emplace_back(std::move(d00));
++		base_elements.emplace_back(std::move(ds));
++		base->SetElements(std::move(base_elements));
++		base->SetNoiseScaleDeg(
++		  lhs_cpu->GetNoiseScaleDeg() + rhs_cpu->GetNoiseScaleDeg());
++		base->SetScalingFactor(
++		  lhs_cpu->GetScalingFactor() * rhs_cpu->GetScalingFactor());
++		base->SetScalingFactorInt(
++		  lhs_cpu->GetScalingFactorInt().ModMul(
++		    rhs_cpu->GetScalingFactorInt(),
++		    lhs_cpu->GetCryptoParameters()->GetPlaintextModulus()));
++
++		// Embed P*d00 and P*ds, add both mixed-basis KSK products in QP,
++		// then divide by P exactly once for the whole output ciphertext.
++		auto extended = context->KeySwitchExt(base, true);
++		auto& extended_elements = extended->GetElements();
++		extended_elements[0] += (*dt_qp)[0];
++		extended_elements[1] += (*dt_qp)[1];
++		extended_elements[0] += (*dst_qp)[0];
++		extended_elements[1] += (*dst_qp)[1];
++		auto output = context->KeySwitchDown(extended);
++
++		Ciphertext<DCRTPoly> result =
++		  std::make_shared<CiphertextImpl<DCRTPoly>>(
++		    this->self_reference.lock());
++		result->cpu = std::make_any<CpuCiphertext>(std::move(output));
++		return result;
++	}
++	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(lhs));
++	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(rhs));
++
++	Ciphertext<DCRTPoly> result =
++	  std::make_shared<CiphertextImpl<DCRTPoly>>(*lhs);
++	auto out_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(result->gpu));
++	auto rhs_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(rhs->gpu));
++	out_gpu->twistedProduct(*rhs_gpu, index);
++	return result;
++}
++
+ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalRotate(const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
+ 	FIDESlib::CudaNvtxRange r("API");
+ 
+@@ -1422,6 +1932,144 @@ void CryptoContextImpl<DCRTPoly>::EvalRotateInPlace(Ciphertext<DCRTPoly>& cipher
+ 	ct_gpu->rotate(index);
+ }
+ 
++Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalConjugate(
++  const Ciphertext<DCRTPoly>& ciphertext) {
++	FIDESlib::CudaNvtxRange r("API");
++	if (this->devices.empty()) {
++		// FIDES_CPU_TWISTED_V1
++		using CpuCiphertext =
++		  lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
++		auto& context = std::any_cast<
++		  const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
++		const auto& input =
++		  std::any_cast<const CpuCiphertext&>(ciphertext->cpu);
++		const uint32_t conjugation_index =
++		  2 * context->GetRingDimension() - 1;
++		const auto& keys =
++		  context->GetEvalAutomorphismKeyMap(input->GetKeyTag());
++		auto output = context->EvalAutomorphism(
++		  input, conjugation_index, keys);
++
++		Ciphertext<DCRTPoly> result =
++		  std::make_shared<CiphertextImpl<DCRTPoly>>(
++		    this->self_reference.lock());
++		result->cpu =
++		  std::make_any<CpuCiphertext>(std::move(output));
++		return result;
++	}
++
++	this->LoadCiphertext(
++	  const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
++	auto& contextGpu =
++	  std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
++
++	const auto makeEmptyResult = [&]() {
++		Ciphertext<DCRTPoly> result =
++		  std::make_shared<CiphertextImpl<DCRTPoly>>(
++		    this->self_reference.lock());
++
++		// Keep a cheap shared CPU placeholder for a later GPU-to-CPU sync.
++		const auto& cpuCiphertext = std::any_cast<
++		  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
++		result->cpu = std::make_any<
++		  lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(cpuCiphertext);
++		result->need_lazy_copy = true;
++
++		auto emptyGpu =
++		  std::make_shared<FIDESlib::CKKS::Ciphertext>(contextGpu);
++		result->gpu =
++		  this->RegisterDeviceCiphertext(std::move(emptyGpu));
++		result->loaded = true;
++		result->original_level = ciphertext->original_level;
++		return result;
++	};
++
++	auto result = makeEmptyResult();
++	auto inputGpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(ciphertext->gpu));
++	auto resultGpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(result->gpu));
++	resultGpu->conjugate(*inputGpu);
++	return result;
++}
++
++std::pair<Ciphertext<DCRTPoly>, Ciphertext<DCRTPoly>>
++CryptoContextImpl<DCRTPoly>::EvalRotateConjugateHoisted(
++  const Ciphertext<DCRTPoly>& ciphertext, const int32_t index) {
++	FIDESlib::CudaNvtxRange r("API");
++	if (this->devices.empty()) {
++		OPENFHE_THROW(
++		  "EvalRotateConjugateHoisted is only implemented for the GPU path");
++	}
++
++	this->LoadCiphertext(
++	  const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
++	auto& contextGpu =
++	  std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
++
++	const auto makeEmptyResult = [&]() {
++		Ciphertext<DCRTPoly> result =
++		  std::make_shared<CiphertextImpl<DCRTPoly>>(
++		    this->self_reference.lock());
++
++		// Keep a cheap shared CPU placeholder for a later GPU-to-CPU sync.
++		const auto& cpuCiphertext = std::any_cast<
++		  const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
++		result->cpu = std::make_any<
++		  lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(cpuCiphertext);
++		result->need_lazy_copy = true;
++
++		auto emptyGpu =
++		  std::make_shared<FIDESlib::CKKS::Ciphertext>(contextGpu);
++		result->gpu =
++		  this->RegisterDeviceCiphertext(std::move(emptyGpu));
++		result->loaded = true;
++		result->original_level = ciphertext->original_level;
++		return result;
++	};
++
++	const char* coldProfileEnv = std::getenv("FIDES_HOIST_COLD_PROFILE");
++	static bool coldProfileConsumed = false;
++	const bool coldProfile = coldProfileEnv != nullptr &&
++	  std::string(coldProfileEnv) != "0" && !coldProfileConsumed;
++	if (coldProfile)
++		coldProfileConsumed = true;
++	if (coldProfile)
++		this->Synchronize();
++	const auto coldApiBegin = std::chrono::steady_clock::now();
++
++	auto rotated = makeEmptyResult();
++	auto conjugated = makeEmptyResult();
++
++	if (coldProfile) {
++		this->Synchronize();
++		const double elapsed = std::chrono::duration<double, std::milli>(
++		  std::chrono::steady_clock::now() - coldApiBegin).count();
++		std::cout << "[hoisted-cold] " << std::left << std::setw(34)
++		          << "API create outputs" << std::right << std::fixed
++		          << std::setprecision(3) << elapsed << " ms\n";
++	}
++
++	auto inputGpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(ciphertext->gpu));
++	auto rotatedGpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(rotated->gpu));
++	auto conjugatedGpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(
++	  this->GetDeviceCiphertext(conjugated->gpu));
++
++	inputGpu->rotate_conjugate_hoisted(
++	  static_cast<int>(index), *rotatedGpu, *conjugatedGpu);
++	if (coldProfile) {
++		this->Synchronize();
++		const double elapsed = std::chrono::duration<double, std::milli>(
++		  std::chrono::steady_clock::now() - coldApiBegin).count();
++		std::cout << "[hoisted-cold] " << std::left << std::setw(34)
++		          << "API pair total" << std::right << std::fixed
++		          << std::setprecision(3) << elapsed << " ms\n";
++	}
++	return { std::move(rotated), std::move(conjugated) };
++}
++
+ std::shared_ptr<void> CryptoContextImpl<DCRTPoly>::EvalFastRotationPrecompute(const Ciphertext<DCRTPoly>& ct) {
+ 	FIDESlib::CudaNvtxRange r("API");
+ 
+@@ -1968,4 +2616,4 @@ std::vector<int> CryptoContextImpl<DCRTPoly>::GetConvolutionTransformRotationInd
+ 	return FIDESlib::CKKS::GetConvolutionTransformRotationIndices(rowSize, bStep, stride, gStep);
+ }
+ 
+-} // namespace fideslib
+\ No newline at end of file
++} // namespace fideslib
+diff --git a/api/CryptoContext.hpp b/api/CryptoContext.hpp
+index 43556f2..6fd72e7 100644
+--- a/api/CryptoContext.hpp
++++ b/api/CryptoContext.hpp
+@@ -5,6 +5,7 @@
+ #include <complex>
+ #include <cstdint>
+ #include <functional>
++#include <map>
+ #include <memory>
+ #include <shared_mutex>
+ #include <unordered_map>
+@@ -74,6 +75,24 @@ template <> class CryptoContextImpl<DCRTPoly> {
+ 	/// @brief Generate the evaluation rotation keys for the given steps.
+ 	void EvalRotateKeyGen(const PrivateKey<DCRTPoly>& sk, const std::vector<int32_t>& steps);
+ 
++	// FIDES_TWISTED_PRODUCT_V1: generate t->s and (s*t)->s keys,
++	// where t is the raw automorphism associated with each step.  The CPU
++	// path also creates the CKKS conjugation automorphism key.
++	void EvalTwistedProductKeyGen(const PrivateKey<DCRTPoly>& sk,
++	  const std::vector<int32_t>& steps,
++	  uint32_t slots = 0);
++
++
++
++	// FIDES_DERIVED_TWISTED_KEYS_V1
++	// Publicly derive the two mixed-basis keys needed by EvalTwistedProduct
++	// from standard rotation and relinearization keys.  This API deliberately
++	// accepts no private key.
++	void EvalDerivedTwistedProductKeyGen(
++	  const PublicKey<DCRTPoly>& publicKey,
++	  const std::vector<int32_t>& steps,
++	  uint32_t slots = 0);
++
+ 	// ---- Bootstrapping ----
+ 
+ 	/// @brief Generate bootstrap precomputation data.
+@@ -163,9 +182,44 @@ template <> class CryptoContextImpl<DCRTPoly> {
+ 	void EvalSquareInPlace(Ciphertext<DCRTPoly>& ct);
+ 	Ciphertext<DCRTPoly> EvalSquareMutable(Ciphertext<DCRTPoly>& ct);
+ 
++    /// Control experiment for lhs * Rotate(rhs, index).
++    /// This combines API/object handling only; it does not remove ModDown or
++    /// either key-switching operation.
++    Ciphertext<DCRTPoly> EvalRotateThenMultControl(
++        const Ciphertext<DCRTPoly>& lhs,
++        const Ciphertext<DCRTPoly>& rhs,
++        int32_t index);
++
++
++
++	// FIDES_AFFINE_SKEW_SQUARE_V1
++	// Return {G + P*sigma_index(G), P*sigma_index(P)}.  The second result is
++	// null when produceP is false on the terminal prefix level.
++	std::pair<Ciphertext<DCRTPoly>, Ciphertext<DCRTPoly>>
++	EvalAffineSkewSquare(const Ciphertext<DCRTPoly>& propagate,
++	  const Ciphertext<DCRTPoly>& generate,
++	  int32_t index,
++	  bool produceP = true);
++
++	// FIDES_TWISTED_PRODUCT_V1: lhs * sigma_index(rhs), evaluated directly
++	// in the mixed key basis {1,s,t,s*t} with one final ModDown.
++	Ciphertext<DCRTPoly> EvalTwistedProduct(const Ciphertext<DCRTPoly>& lhs,
++	  const Ciphertext<DCRTPoly>& rhs,
++	  int32_t index);
++
+ 	Ciphertext<DCRTPoly> EvalRotate(const Ciphertext<DCRTPoly>& ciphertext, int32_t index);
+ 	void EvalRotateInPlace(Ciphertext<DCRTPoly>& ciphertext, int32_t index);
+ 
++	/// Slot-wise CKKS complex conjugation on CPU or GPU.
++	Ciphertext<DCRTPoly> EvalConjugate(
++	  const Ciphertext<DCRTPoly>& ciphertext);
++
++	/// Return {Rotate(ciphertext, index), Conjugate(ciphertext)} using one
++	/// shared GPU hoisting precomputation.  GPU path only.
++	std::pair<Ciphertext<DCRTPoly>, Ciphertext<DCRTPoly>>
++	EvalRotateConjugateHoisted(
++	  const Ciphertext<DCRTPoly>& ciphertext, int32_t index);
++
+ 	std::shared_ptr<void> EvalFastRotationPrecompute(const Ciphertext<DCRTPoly>& ct);
+ 	Ciphertext<DCRTPoly> EvalFastRotation(const Ciphertext<DCRTPoly>& ct, int32_t index, uint32_t m, const std::shared_ptr<void>& precomp);
+ 	Ciphertext<DCRTPoly> EvalFastRotationExt(const Ciphertext<DCRTPoly>& ct, int32_t index, const std::shared_ptr<void>& digits, bool addFirst);
+@@ -220,6 +274,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
+ 	uint32_t multiplicative_depth = 0;
+ 	/// @brief Rotation indexes for which rotation keys are available.
+ 	std::vector<int32_t> rotation_indexes;
++	// FIDES_TWISTED_PRODUCT_V1: CPU evaluation keys are retained for CPU
++	// execution and also transferred by LoadContext for GPU execution.
++	std::map<int32_t, std::pair<std::any, std::any>> twisted_product_eval_keys;
+ 	/// @brief Bootstrap slots available.
+ 	std::vector<uint32_t> slots_bootstrap;
+ 	/// @brief Secret key distribution.
+@@ -252,4 +309,4 @@ template <> class CryptoContextImpl<DCRTPoly> {
+ 
+ } // namespace fideslib
+ 
+-#endif // API_CRYPTOCONTEXT_HPP
+\ No newline at end of file
++#endif // API_CRYPTOCONTEXT_HPP
+diff --git a/api/Definitions.hpp b/api/Definitions.hpp
+index 7b308a0..ed9d610 100644
+--- a/api/Definitions.hpp
++++ b/api/Definitions.hpp
+@@ -52,6 +52,12 @@ struct DecryptResult {
+ 	uint32_t messageLength;
+ };
+ 
++/// @brief CKKS user-data representation.
++enum CKKSDataType {
++    REAL = 0,
++    COMPLEX = 1,
++};
++
+ /// @brief Enumeration of supported scaling techniques.
+ enum ScalingTechnique {
+     FIXEDMANUAL = 0,
+diff --git a/src/CKKS/Bootstrap.cu b/src/CKKS/Bootstrap.cu
+index 099fff3..eaf6446 100644
+--- a/src/CKKS/Bootstrap.cu
++++ b/src/CKKS/Bootstrap.cu
+@@ -2,6 +2,8 @@
+ // Created by carlosad on 4/12/24.
+ //
+ 
++#include <cstdlib>
++#include <cstring>
+ #include "CKKS/AccumulateBroadcast.cuh"
+ #include "CKKS/ApproxModEval.cuh"
+ #include "CKKS/Bootstrap.cuh"
+@@ -166,6 +168,29 @@ void FIDESlib::CKKS::BootstrapCPUraise(Ciphertext& ctxt,
+ 	}
+ }
+ 
++
++// PULSAR_BOOT_STAGE_PROBE_V1
++namespace {
++
++bool PulsarBootStopAfterV1(const char* stage) {
++    const char* requested = std::getenv("PULSAR_BOOT_STOP_AFTER");
++    return requested != nullptr && std::strcmp(requested, stage) == 0;
++}
++
++template <typename CiphertextT>
++void PulsarBootReportStopV1(
++    CiphertextT& ctxt,
++    int oldSlots,
++    const char* stage) {
++    ctxt.slots = oldSlots;
++    std::cerr << "[PulsarBootStage] stop_after=" << stage
++              << " internal_level=" << ctxt.getLevel()
++              << " noise_scale_degree=" << ctxt.NoiseLevel
++              << " slots=" << ctxt.slots << std::endl;
++}
++
++}  // namespace
++
+ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
+ 	CudaNvtxRange r(std::string{ sc::current().function_name() });
+ 
+@@ -248,6 +273,11 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
+ 		////////////////////////////////////////////////////////////////
+ 
+ 		Accumulate(ctxt, cc.GetBootPrecomputation(slots).accumulate_bStep, slots, cc.N / 2 / slots);
++	if (PulsarBootStopAfterV1("modraise")) {
++		PulsarBootReportStopV1(ctxt, old_slots, "modraise");
++		return;
++	}
++
+ 	}
+ 
+ 	ctxt.slots = cc.N / 2 == slots ? slots : 2 * slots;
+@@ -263,6 +293,12 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
+ 	} else {
+ 		EvalCoeffsToSlots(ctxt, slots, false);
+ 	}
++
++	if (PulsarBootStopAfterV1("coeff_to_slots")) {
++		PulsarBootReportStopV1(ctxt, old_slots, "coeff_to_slots");
++		return;
++	}
++
+ 	//  std::cout << "ModRed" << std::endl;
+ 
+ 	if (cc.N / 2 == slots) {
+@@ -284,9 +320,20 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
+ 		approxModReductionSparse(ctxt, scalar);
+ 	}
+ 
++
++	if (PulsarBootStopAfterV1("evalmod")) {
++		PulsarBootReportStopV1(ctxt, old_slots, "evalmod");
++		return;
++	}
++
+ 	if (ctxt.NoiseLevel == 2) {
+ 		ctxt.rescale();
+ 	}
++	if (PulsarBootStopAfterV1("post_evalmod_rescale")) {
++		PulsarBootReportStopV1(ctxt, old_slots, "post_evalmod_rescale");
++		return;
++	}
++
+ 
+ 	//  std::cout << "LT" << std::endl;
+ 
+@@ -296,6 +343,12 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
+ 		EvalCoeffsToSlots(ctxt, slots, true);
+ 	}
+ 
++
++	if (PulsarBootStopAfterV1("slots_to_coeffs")) {
++		PulsarBootReportStopV1(ctxt, old_slots, "slots_to_coeffs");
++		return;
++	}
++
+ 	if (cc.N / 2 != slots) {
+ 		aux.rotate(ctxt, slots);
+ 		ctxt.add(aux);
+@@ -303,6 +356,11 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
+ 
+ 	uint64_t corFactor = (uint64_t)1 << std::llround(correction);
+ 	multIntScalar(ctxt, corFactor);
++	if (PulsarBootStopAfterV1("final")) {
++		PulsarBootReportStopV1(ctxt, old_slots, "final");
++		return;
++	}
++
+ 	if constexpr (PRINT) {
+ 		cudaDeviceSynchronize();
+ 		std::cout << "End bootstrap ";
+diff --git a/src/CKKS/Ciphertext.cpp b/src/CKKS/Ciphertext.cpp
+index d05a4ea..a62edf0 100644
+--- a/src/CKKS/Ciphertext.cpp
++++ b/src/CKKS/Ciphertext.cpp
+@@ -6,6 +6,9 @@
+ #include "CKKS/Context.cuh"
+ #include "CKKS/KeySwitchingKey.cuh"
+ #include "CKKS/Plaintext.cuh"
++#include <chrono>
++#include <cstdlib>
++#include <iomanip>
+ #include <omp.h>
+ #if defined(__clang__)
+ #include <experimental/source_location>
+@@ -673,6 +676,179 @@ void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
+ 	Out(KEYSWITCH, " finish ");
+ }
+ 
++
++
++// FIDES_AFFINE_SKEW_SQUARE_V1
++void Ciphertext::affineSkewSquare(
++  const Ciphertext& g,
++  Ciphertext& out_g,
++  Ciphertext* out_p,
++  const int index) const {
++	CudaNvtxRange range("AffineSkewSquareRank2Direct");
++	CKKS::SetCurrentContext(cc_);
++	if (keyID != g.keyID)
++		throw std::invalid_argument("affine skew state key IDs differ");
++
++	// P and G leave a prefix level with different scale metadata: P is the
++	// product coordinate, while G includes an affine addition.  Align copies
++	// once here so both module projections use exactly the same P state.
++	Ciphertext p(cc_);
++	Ciphertext g_aligned(cc_);
++	p.copy(*this);
++	g_aligned.copy(g);
++	if (cc.rescaleTechnique == FIXEDAUTO ||
++	    cc.rescaleTechnique == FLEXIBLEAUTO ||
++	    cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
++		if (!p.adjustForMult(g_aligned) && !g_aligned.adjustForMult(p))
++			throw std::runtime_error("cannot align affine skew coordinates");
++	}
++	if (p.getLevel() != g_aligned.getLevel() ||
++	    p.NoiseLevel != 1 || g_aligned.NoiseLevel != 1)
++		throw std::runtime_error("invalid aligned affine skew metadata");
++
++	const int normalized_index = normalyzeIndex(index);
++	if (normalized_index == 0)
++		throw std::invalid_argument("affine skew square requires a nonzero automorphism");
++	KeySwitchingKey& t_to_s =
++	  cc.GetTwistedProductTKey(normalized_index, keyID);
++	KeySwitchingKey& st_to_s =
++	  cc.GetTwistedProductSTKey(normalized_index, keyID);
++
++	// Keep sigma(P) and sigma(G) in their raw t=sigma(s) secret basis.  No
++	// standalone rotation key switch or intermediate ModDown is performed.
++	Ciphertext sigma_g(cc_);
++	sigma_g.copy(g_aligned);
++	sigma_g.automorph(normalized_index, 1);
++	Ciphertext sigma_p(cc_);
++	if (out_p != nullptr) {
++		sigma_p.copy(p);
++		sigma_p.automorph(normalized_index, 1);
++	}
++
++	// Project one coordinate P*sigma(rhs) from {1,s,t,s*t} back to {1,s}.
++	// Invoking this closure for eG and (when live) eP is the scalarized GPU
++	// realization of one rank-2 module operation.  Key lookup and metadata
++	// alignment are shared, while each live coordinate needs its own ModDown.
++	auto project_coordinate = [&](const Ciphertext& rhs,
++	                              const Ciphertext& sigma_rhs,
++	                              Ciphertext& out) {
++		const int level = p.c0.getLevel();
++		RNSPoly d00(cc, level);
++		RNSPoly ds(cc, level);
++		RNSPoly dt(cc, level);
++		RNSPoly dst(cc, level);
++		d00.multElement(p.c0, sigma_rhs.c0);
++		ds.multElement(p.c1, sigma_rhs.c0);
++		dt.multElement(p.c0, sigma_rhs.c1);
++		dst.multElement(p.c1, sigma_rhs.c1);
++
++		dt.modup();
++		dst.modup();
++		RNSPoly dt0(cc, level), dt1(cc, level);
++		RNSPoly dst0(cc, level), dst1(cc, level);
++		for (RNSPoly* component : {&dt0, &dt1, &dst0, &dst1})
++			component->generateSpecialLimbs(false, false);
++		dt1.dotKSKfused(dt0, dt, t_to_s.a, t_to_s.b, &dt);
++		dst1.dotKSKfused(dst0, dst, st_to_s.a, st_to_s.b, &dst);
++		for (RNSPoly* component : {&dt0, &dt1, &dst0, &dst1})
++			component->SetModUp(true);
++
++		out.c0.copy(d00);
++		out.c1.copy(ds);
++		out.extend(true);
++		out.c0.add(dt0);
++		out.c1.add(dt1);
++		out.c0.add(dst0);
++		out.c1.add(dst1);
++		out.modDown(false);
++		out.multMetadata(p, rhs);
++	};
++
++	// eG coordinate: G + P*sigma(G).
++	project_coordinate(g_aligned, sigma_g, out_g);
++	out_g.add(g_aligned);
++
++	// eP coordinate: P*sigma(P).  It is dead after the final prefix level.
++	if (out_p != nullptr)
++		project_coordinate(p, sigma_p, *out_p);
++}
++
++// FIDES_TWISTED_PRODUCT_V1
++void Ciphertext::twistedProduct(const Ciphertext& rhs, const int index__, bool rescale) {
++	CudaNvtxRange range("TwistedProduct");
++	CKKS::SetCurrentContext(cc_);
++	assert(keyID == rhs.keyID);
++
++	if (cc.rescaleTechnique == FIXEDAUTO || cc.rescaleTechnique == FLEXIBLEAUTO ||
++	    cc.rescaleTechnique == FLEXIBLEAUTOEXT) {
++		if (c0.isModUp() || c1.isModUp() || rhs.c0.isModUp() || rhs.c1.isModUp()) {
++			assert(getLevel() == rhs.getLevel());
++			assert(NoiseLevel == rhs.NoiseLevel);
++		}
++		if (!adjustForMult(rhs)) {
++			Ciphertext adjusted_rhs(cc_);
++			adjusted_rhs.copy(rhs);
++			if (!adjusted_rhs.adjustForMult(*this))
++				throw std::runtime_error("cannot align twisted-product operands");
++			twistedProduct(adjusted_rhs, index__, rescale);
++			return;
++		}
++	}
++
++	assert(NoiseLevel == 1);
++	assert(rhs.NoiseLevel == 1);
++	const int index = normalyzeIndex(index__);
++	if (index == 0)
++		throw std::invalid_argument("twisted product requires a nonzero automorphism");
++
++	KeySwitchingKey& t_to_s = cc.GetTwistedProductTKey(index, keyID);
++	KeySwitchingKey& st_to_s = cc.GetTwistedProductSTKey(index, keyID);
++
++	// Raw sigma(rhs): no rotation key switch and no ModDown.  Its components
++	// decrypt under t = sigma(s), which is why the mixed basis is required.
++	Ciphertext sigma_rhs(cc_);
++	sigma_rhs.copy(rhs);
++	sigma_rhs.automorph(index, 1);
++
++	const int level = c0.getLevel();
++	RNSPoly d00(cc, level);  // a0*b0, basis 1
++	RNSPoly ds(cc, level);   // a1*b0, basis s
++	RNSPoly dt(cc, level);   // a0*b1, basis t
++	RNSPoly dst(cc, level);  // a1*b1, basis s*t
++	d00.multElement(c0, sigma_rhs.c0);
++	ds.multElement(c1, sigma_rhs.c0);
++	dt.multElement(c0, sigma_rhs.c1);
++	dst.multElement(c1, sigma_rhs.c1);
++
++	// Materialize both mixed key switches in QP.  Unlike Rotate->Mult, no
++	// intermediate result is reduced to Q before the ciphertext product.
++	dt.modup();
++	dst.modup();
++	RNSPoly dt0(cc, level), dt1(cc, level);
++	RNSPoly dst0(cc, level), dst1(cc, level);
++	for (RNSPoly* out : { &dt0, &dt1, &dst0, &dst1 })
++		out->generateSpecialLimbs(false, false);
++	dt1.dotKSKfused(dt0, dt, t_to_s.a, t_to_s.b, &dt);
++	dst1.dotKSKfused(dst0, dst, st_to_s.a, st_to_s.b, &dst);
++	for (RNSPoly* out : { &dt0, &dt1, &dst0, &dst1 })
++		out->SetModUp(true);
++
++	// Embed the 1 and s terms as P*d00 and P*ds, add both switching-key
++	// contributions in QP, and perform exactly one output ModDown.
++	c0.copy(d00);
++	c1.copy(ds);
++	extend(true);
++	c0.add(dt0);
++	c1.add(dt1);
++	c0.add(dst0);
++	c1.add(dst1);
++	modDown(false);
++
++	this->multMetadata(*this, rhs);
++	if (rescale && cc.rescaleTechnique == CKKS::FIXEDMANUAL)
++		this->rescale();
++}
++
+ void Ciphertext::square(bool rescale) {
+ 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+ 	CKKS::SetCurrentContext(cc_);
+@@ -934,10 +1110,59 @@ void Ciphertext::conjugate(const Ciphertext& c) {
+ 	this->copyMetadata(c);
+ }
+ 
++void Ciphertext::rotate_conjugate_hoisted(
++  const int rotation, Ciphertext& rotated, Ciphertext& conjugated) {
++	const int conjugationIndex = 2 * cc.N - 1;
++	rotate_hoisted(
++	  { rotation, conjugationIndex },
++	  { &rotated, &conjugated },
++	  false);
++}
++
+ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ciphertext*> results, const bool ext) {
++	const char* coldProfileEnv = std::getenv("FIDES_HOIST_COLD_PROFILE");
++	const int conjugationIndex = 2 * cc.N - 1;
++	bool hasConjugation = false;
++	for (const int index : indexes_)
++		hasConjugation = hasConjugation || index == conjugationIndex;
++	static bool coldProfileConsumed = false;
++	const bool coldProfile = coldProfileEnv != nullptr &&
++	  std::string(coldProfileEnv) != "0" && indexes_.size() == 2 &&
++	  hasConjugation && !coldProfileConsumed;
++	if (coldProfile)
++		coldProfileConsumed = true;
++	auto coldSync = [&]() {
++		if (!coldProfile)
++			return;
++		for (const int device : cc.GPUid) {
++			cudaSetDevice(device);
++			cudaDeviceSynchronize();
++		}
++		// modupMGPU creates a CUDA event before selecting its worker GPU.
++		// OpenMP worker 0 is normally the calling thread, so leave it on GPU 0.
++		if (!cc.GPUid.empty())
++			cudaSetDevice(cc.GPUid.front());
++	};
++	coldSync();
++	const auto coldTotalBegin = std::chrono::steady_clock::now();
++	auto coldPrevious = coldTotalBegin;
++	auto coldLap = [&](const char* label) {
++		if (!coldProfile)
++			return;
++		coldSync();
++		const auto now = std::chrono::steady_clock::now();
++		const double elapsed =
++		  std::chrono::duration<double, std::milli>(now - coldPrevious).count();
++		std::cout << "[hoisted-cold] " << std::left << std::setw(34)
++		          << label << std::right << std::fixed << std::setprecision(3)
++		          << elapsed << " ms\n";
++		coldPrevious = now;
++	};
++
+ 	std::vector<int> indexes;
+ 	for (auto i : indexes_) {
+-		indexes.push_back(normalyzeIndex(i));
++		indexes.push_back(
++		  i == conjugationIndex ? i : normalyzeIndex(i));
+ 	}
+ 
+ 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+@@ -958,6 +1183,7 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
+ 		// i->c0.setLevel(c0.getLevel());
+ 		// i->c1.setLevel(c1.getLevel());
+ 	}
++	coldLap("grow output base limbs");
+ 
+ 	if (!hoistRotateFused) {
+ 		if (cc.GPUid.size() == 1) {
+@@ -1052,10 +1278,13 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
+ 		if (cc.GPUid.size() == 1) {
+ 			in.setLevel(c1.getLevel());
+ 			c1.modupInto(in);
++			coldLap("shared ModUp/decomposition");
+ 		} else {
+ 			in.setLevel(c1.getLevel());
+ 			in.copy(c1);
++			coldLap("copy c1 to hoist workspace");
+ 			in.modup();
++			coldLap("shared ModUp/decomposition");
+ 		}
+ 
+ 		if constexpr (PRINT) {
+@@ -1098,7 +1327,17 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
+ 			}
+ 		}
+ 
++		coldLap("collect two rotation keys");
++		if (coldProfile) {
++			for (auto* output : c0_out)
++				output->generateSpecialLimbs(false, false);
++			for (auto* output : c1_out)
++				output->generateSpecialLimbs(false, false);
++			coldLap("allocate output special limbs");
++		}
++
+ 		in.hoistedRotationFused(index, c0_out, c1_out, ksk_a, ksk_b, c0, c1);
++		coldLap("two KSK products + automorphism");
+ 
+ 		if (!ext) {
+ 			for (size_t i = 0; i < indexes.size(); ++i) {
+@@ -1107,6 +1346,14 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
+ 				}
+ 			}
+ 		}
++		coldLap("two output ModDowns");
++		if (coldProfile) {
++			const double total = std::chrono::duration<double, std::milli>(
++			  std::chrono::steady_clock::now() - coldTotalBegin).count();
++			std::cout << "[hoisted-cold] " << std::left << std::setw(34)
++			          << "lower pair total" << std::right << std::fixed
++			          << std::setprecision(3) << total << " ms\n";
++		}
+ 	}
+ }
+ 
+diff --git a/src/CKKS/Ciphertext.cuh b/src/CKKS/Ciphertext.cuh
+index 9a0260d..c69d24a 100644
+--- a/src/CKKS/Ciphertext.cuh
++++ b/src/CKKS/Ciphertext.cuh
+@@ -262,6 +262,30 @@ class Ciphertext {
+ 	 * @param rescale Perform rescaling after multiplication if true.
+ 	 * @param moddown Perform modulus down‑conversion if true.
+ 	 */
++
++	/**
++	 * FIDES_TWISTED_PRODUCT_V1
++	 * Compute this * sigma_index(rhs) directly in the mixed secret basis
++	 * {1, s, t, s*t}, where t = sigma_index(s).  The t and s*t terms use
++	 * dedicated switching keys and all four terms share one final ModDown.
++	 */
++
++	/**
++	 * FIDES_AFFINE_SKEW_SQUARE_V1
++	 * Evaluate the closed rank-2 affine skew state
++	 *   G' = G + P*sigma_index(G), P' = P*sigma_index(P).
++	 * `this` is P.  `out_p` may be null on the terminal prefix level.
++	 * V1 projects both module coordinates directly through the mixed secret
++	 * basis.  It does not call the scalar twisted-product API.  The public U
++	 * exponent is managed by the caller.
++	 */
++	void affineSkewSquare(const Ciphertext& g,
++	  Ciphertext& out_g,
++	  Ciphertext* out_p,
++	  int index) const;
++
++	void twistedProduct(const Ciphertext& rhs, int index, bool rescale = false);
++
+ 	void mult(const Ciphertext& b, bool rescale = false, bool moddown = true);
+ 
+ 	/**
+@@ -451,6 +475,13 @@ class Ciphertext {
+ 	 * @param results Vector to receive resulting ciphertext pointers.
+ 	 * @param ext     If true, extends ciphertexts before rotation.
+ 	 */
++	/**
++	 * Compute Rotate(*this, rotation) and Conjugate(*this) with one shared
++	 * ModUp/decomposition of c1.  The two key-switch products remain distinct.
++	 */
++	void rotate_conjugate_hoisted(
++	  int rotation, Ciphertext& rotated, Ciphertext& conjugated);
++
+ 	void rotate_hoisted(const std::vector<int>& indexes, std::vector<Ciphertext*> results, bool ext);
+ 
+ 	/**
+diff --git a/src/CKKS/Context.cu b/src/CKKS/Context.cu
+index 2a00b7a..5ffda23 100644
+--- a/src/CKKS/Context.cu
++++ b/src/CKKS/Context.cu
+@@ -597,6 +597,58 @@ void ContextData::AddRotationKey(int index, KeySwitchingKey&& ksk) {
+ 	precom.keys.at(ksk.keyID).rot_keys.emplace(index, std::move(ksk));
+ }
+ 
++
++// FIDES_TWISTED_PRODUCT_V1
++namespace {
++int NormalizeTwistedProductIndex(int index, int ringDimension) {
++	index %= ringDimension / 2;
++	if (index < 0)
++		index += ringDimension / 2;
++	return index;
++}
++}
++
++void ContextData::AddTwistedProductKeys(
++  int index, KeySwitchingKey&& t_to_s, KeySwitchingKey&& st_to_s) {
++	index = NormalizeTwistedProductIndex(index, N);
++	if (t_to_s.keyID != st_to_s.keyID)
++		throw std::invalid_argument("twisted-product key IDs do not match");
++	if (!precom.keys.contains(t_to_s.keyID))
++		precom.keys[t_to_s.keyID] = Precomputations::KeyPrecomputations{};
++	auto& keys = precom.keys.at(t_to_s.keyID);
++	keys.twisted_t_keys.erase(index);
++	keys.twisted_st_keys.erase(index);
++	keys.twisted_t_keys.emplace(index, std::move(t_to_s));
++	keys.twisted_st_keys.emplace(index, std::move(st_to_s));
++}
++
++KeySwitchingKey& ContextData::GetTwistedProductTKey(
++  int index, const KeyHash& keyID) {
++	index = NormalizeTwistedProductIndex(index, N);
++	if (!HasTwistedProductKeys(index, keyID))
++		throw std::runtime_error("twisted-product t->s key not found for index " +
++		                         std::to_string(index));
++	return precom.keys.at(keyID).twisted_t_keys.at(index);
++}
++
++KeySwitchingKey& ContextData::GetTwistedProductSTKey(
++  int index, const KeyHash& keyID) {
++	index = NormalizeTwistedProductIndex(index, N);
++	if (!HasTwistedProductKeys(index, keyID))
++		throw std::runtime_error("twisted-product st->s key not found for index " +
++		                         std::to_string(index));
++	return precom.keys.at(keyID).twisted_st_keys.at(index);
++}
++
++bool ContextData::HasTwistedProductKeys(int index, const KeyHash& keyID) {
++	index = NormalizeTwistedProductIndex(index, N);
++	if (!precom.keys.contains(keyID))
++		return false;
++	const auto& keys = precom.keys.at(keyID);
++	return keys.twisted_t_keys.contains(index) &&
++	       keys.twisted_st_keys.contains(index);
++}
++
+ bool ContextData::HasRotationKey(int index, const KeyHash& keyID) {
+ 	// index = index % (cc.N / 2);
+ 	while (index < 0)
+diff --git a/src/CKKS/Context.cuh b/src/CKKS/Context.cuh
+index b65e922..e714d83 100644
+--- a/src/CKKS/Context.cuh
++++ b/src/CKKS/Context.cuh
+@@ -35,6 +35,10 @@ struct Precomputations {
+ 	struct KeyPrecomputations {
+ 		std::unique_ptr<KeySwitchingKey> eval_key;
+ 		std::map<int, KeySwitchingKey> rot_keys;
++
++		// FIDES_TWISTED_PRODUCT_V1: keys for t -> s and (s*t) -> s.
++		std::map<int, KeySwitchingKey> twisted_t_keys;
++		std::map<int, KeySwitchingKey> twisted_st_keys;
+ 	};
+ 
+ 	std::map<KeyHash, KeyPrecomputations> keys;
+@@ -157,6 +161,12 @@ class ContextData {
+ 	KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID);
+ 	KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID, int slots, int& actual_index);
+ 	bool HasRotationKey(int index, const KeyHash& keyID);
++
++	// FIDES_TWISTED_PRODUCT_V1
++	void AddTwistedProductKeys(int index, KeySwitchingKey&& t_to_s, KeySwitchingKey&& st_to_s);
++	KeySwitchingKey& GetTwistedProductTKey(int index, const KeyHash& keyID);
++	KeySwitchingKey& GetTwistedProductSTKey(int index, const KeyHash& keyID);
++	bool HasTwistedProductKeys(int index, const KeyHash& keyID);
+ 	void AddEvalKey(KeySwitchingKey&& ksk);
+ 	KeySwitchingKey& GetEvalKey(const KeyHash& keyID);
+ 	int GetBootK();
+diff --git a/src/CKKS/LimbPartitionMGPU.cu b/src/CKKS/LimbPartitionMGPU.cu
+index a766fd9..af33da6 100644
+--- a/src/CKKS/LimbPartitionMGPU.cu
++++ b/src/CKKS/LimbPartitionMGPU.cu
+@@ -44,8 +44,23 @@ static bool envGraphCapture(bool def = false) {
+ 	return out;
+ }
+ 
++static bool envModupGraphCapture(bool def = false) {
++	bool out = def;
++
++	char* res = getenv("FIDESLIB_USE_MODUP_GRAPH_CAPTURE");
++	if (res && !(0 == std::strcmp(res, ""))) {
++		out = atoi(res);
++		std::cout << "FIDESLIB_USE_MODUP_GRAPH_CAPTURE=" << res
++		          << ", set to: " << out << std::endl;
++	}
++	return out;
++}
++
++
++
+ bool MEMCPY_PEER   = envMemcopyPeer(true);
+ bool GRAPH_CAPTURE = envGraphCapture(true);
++bool MODUP_GRAPH_CAPTURE = envModupGraphCapture(true);
+ bool PEER_ACCESS   = envPeerAccess(false);
+ 
+ void LimbPartition::rescaleMGPU() {
+@@ -1906,7 +1921,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 		limb_size++;
+ 	const int digits_per_it = MEMCPY_PEER ? 1 : 1 /*dnum*/; // cc.logN <= 15 ? num_d : cc.logN == 16 ? std::max((num_d + 1) / 2, 1) : 1;
+ 	s.wait(c0.s);
+-	if (GRAPH_CAPTURE) {
++	if (MODUP_GRAPH_CAPTURE) {
+ 		if ((!MEMCPY_PEER || (MEMCPY_PEER && id == 0))) {
+ 
+ 			if (exec_old != map_exec.end()) {
+@@ -1927,7 +1942,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 	} else {
+ 		skip = 0;
+ 	}
+-	if (MEMCPY_PEER && GRAPH_CAPTURE) {
++	if (MEMCPY_PEER && MODUP_GRAPH_CAPTURE) {
+ 		*thread_stop[id] += 1;
+ 		if (id == 0) {
+ 			for (uint32_t peer = 1; peer < cc.GPUid.size(); ++peer) {
+@@ -1966,7 +1981,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 			goto skip_capture;
+ 		}
+ 		openmp_synchronize();
+-		if (GRAPH_CAPTURE) {
++		if (MODUP_GRAPH_CAPTURE) {
+ 			CudaCheckErrorModNoSync;
+ 			// cudaDeviceSynchronize();
+ 			cudaStreamBeginCapture(s.ptr(), cudaStreamCaptureModeThreadLocal /*cudaStreamCaptureModeRelaxed*/);
+@@ -2053,7 +2068,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 						cc.digitStreamForMemcpyPeer.at(d).at(i).at(id).wait(
+ 						  s); // ensure gather buffer is created before peer memcpy, we use s as the dependency will be older than on stream
+ 					}
+-					if (MEMCPY_PEER && GRAPH_CAPTURE) {
++					if (MEMCPY_PEER && MODUP_GRAPH_CAPTURE) {
+ 						*thread_stop[id] += 1;
+ 						if (id != 0) {
+ 							while (*thread_stop[id] >= *thread_stop[id - 1])
+@@ -2120,7 +2135,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 							start += cc.meta[i].size();
+ 						}
+ 					}
+-					if (MEMCPY_PEER && GRAPH_CAPTURE) {
++					if (MEMCPY_PEER && MODUP_GRAPH_CAPTURE) {
+ 						*thread_stop[id] += 1;
+ 						if (id != 0) {
+ 							while (*thread_stop[id] >= *thread_stop[id - 1])
+@@ -2193,7 +2208,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 			} else if (cc.GPUid.size() > 1) {
+ 				stream.record();
+ 
+-				if (MEMCPY_PEER && GRAPH_CAPTURE) {
++				if (MEMCPY_PEER && MODUP_GRAPH_CAPTURE) {
+ 					*thread_stop[id] += 1;
+ 					if (id != 0) {
+ 						while (*thread_stop[id] >= *thread_stop[id - 1])
+@@ -2209,7 +2224,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 					if (static_cast<size_t>(id) != i)
+ 						stream.wait(cc.digitStream[d][i]);
+ 				}
+-				if (MEMCPY_PEER && GRAPH_CAPTURE) {
++				if (MEMCPY_PEER && MODUP_GRAPH_CAPTURE) {
+ 					*thread_stop[id] += 1;
+ 					if (id != 0) {
+ 						while (*thread_stop[id] >= *thread_stop[id - 1])
+@@ -2378,7 +2393,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 		}
+ 	}
+ 
+-	if (MEMCPY_PEER && GRAPH_CAPTURE) {
++	if (MEMCPY_PEER && MODUP_GRAPH_CAPTURE) {
+ 		*thread_stop[id] += 1;
+ 		if (id != 0) {
+ 			while (*thread_stop[id] >= *thread_stop[id - 1])
+@@ -2394,7 +2409,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 		openmp_synchronize();
+ 	}
+ 
+-	if ((MEMCPY_PEER && GRAPH_CAPTURE && id == 0) || (!MEMCPY_PEER && GRAPH_CAPTURE)) {
++	if ((MEMCPY_PEER && MODUP_GRAPH_CAPTURE && id == 0) || (!MEMCPY_PEER && MODUP_GRAPH_CAPTURE)) {
+ 		{
+ 			bool ok = true;
+ 			if (exec_old != map_exec.end()) {
+@@ -2447,14 +2462,14 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>&
+ 			}
+ 		}
+ 	skip_capture:
+-		if ((MEMCPY_PEER && GRAPH_CAPTURE && id == 0) || (!MEMCPY_PEER && GRAPH_CAPTURE)) {
++		if ((MEMCPY_PEER && MODUP_GRAPH_CAPTURE && id == 0) || (!MEMCPY_PEER && MODUP_GRAPH_CAPTURE)) {
+ 			CudaCheckErrorModNoSync;
+ 			cudaGraphLaunch(exec_old->second.second, s.ptr());
+ 			CudaCheckErrorModNoSync;
+ 		}
+ 	}
+ 
+-	if (MEMCPY_PEER && GRAPH_CAPTURE) {
++	if (MEMCPY_PEER && MODUP_GRAPH_CAPTURE) {
+ 		if (skip) {
+ 			openmp_synchronize();
+ 		} else {

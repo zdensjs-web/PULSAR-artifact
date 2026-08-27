@@ -1,4 +1,8 @@
 /build/
+/build-*/
+/.build/
+/.deps/
+/.local/
 /cmake-build-*/
 /.cache/
 __pycache__/

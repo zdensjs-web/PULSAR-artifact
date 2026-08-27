@@ -162,8 +162,8 @@ std::vector<int32_t> FHEZImpl::FindBootstrapRotationIndices(uint32_t zN, uint32_
         // Computing the baby-step g and the giant-step h.
         auto zNDiv2 = zN / 2;
         // FUNNY that bStep = g...
-        const uint32_t g = std::ceil(std::sqrt(zNDiv2));
-        const uint32_t h = std::ceil(static_cast<double>(zNDiv2) / g);
+        const int32_t g = static_cast<int32_t>(std::ceil(std::sqrt(zNDiv2)));
+        const int32_t h = static_cast<int32_t>(std::ceil(static_cast<double>(zNDiv2) / g));
 
         // We have both positive and negative rotations
         for (int32_t i = 1; i <= g; ++i) {
@@ -201,7 +201,7 @@ std::vector<int32_t> FHEZImpl::FindBootstrapRotationIndices(uint32_t zN, uint32_
     {
         auto w         = p.m_w;
         auto numIter   = static_cast<uint32_t>(std::ceil(static_cast<double>(zN) / (static_cast<double>(w))));
-        auto batchSize = numIter / 2;
+        const int32_t batchSize = static_cast<int32_t>(numIter / 2);
 
         // For pre-rotation and LUT.MSB result combination
         for (int32_t i = 0; i != batchSize; ++i) {

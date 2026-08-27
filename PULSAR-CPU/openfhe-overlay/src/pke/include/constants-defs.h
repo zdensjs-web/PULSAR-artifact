@@ -154,6 +154,8 @@ enum CompressionLevel {
     SLACK   = 3   // less efficient with weaker security assumption
 };
 
+using COMPRESSION_LEVEL = CompressionLevel;
+
 }  // namespace lbcrypto
 
 #endif  // __CONSTANTS_DEFS_H__

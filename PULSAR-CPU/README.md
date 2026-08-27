@@ -6,10 +6,11 @@ supports dense SIMD packing, complex-packed parallel prefix computation,
 Boolean-to-Boolean bootstrapping, Prefix Boot, and Q33/43-bit-scale
 evaluation.
 
-PULSAR-CPU depends on an OpenFHE 1.4.0 source tree. The bootstrapping code used
-by PULSAR originated in the FHE-SIMD-ALU OpenFHE prototype, but the required
-extension is included under `openfhe-overlay/`. Users do **not** need to clone,
-build, or link FHE-SIMD-ALU separately. See [NOTICE](NOTICE) for provenance.
+PULSAR-CPU bundles the pinned FHE-SIMD-ALU OpenFHE baseline required by the
+implementation, together with Intel HEXL 1.2.6, Google cpu_features, and the
+other source dependencies that are not installed as Ubuntu packages.
+Installation does not clone source code from GitHub. See [NOTICE](NOTICE) for
+provenance.
 
 ## Included benchmarks
 
@@ -73,82 +74,70 @@ PULSAR-CPU/
 |       |-- core/          fixed-point and complex-transform support
 |       `-- pke/           FHEZ, PULSAR operators, schedulers, benchmarks
 |-- tests/                  plaintext correctness checks
+|-- vendor/                 pinned dependency sources and checksums
 |-- install_pulsar_openfhe.py
+|-- setup_cpu.sh            source extraction, configuration, and build
 |-- run_pulsar_*.sh
 |-- LICENSE
 `-- NOTICE
 ```
 
-The installer copies the overlay into an OpenFHE source tree. Existing files
-are backed up under `.pulsar-openfhe-backup-v1.3.2/` before replacement.
-OpenFHE uses recursive source discovery, so no handwritten CMake target patch
-is required. CMake must be reconfigured after installation to discover the
-new benchmark files.
+`setup_cpu.sh` extracts the pinned baseline into `.build/openfhe`, builds the
+vendored Intel HEXL source, applies `openfhe-overlay/`, builds tcmalloc, and
+then builds the PULSAR executables. The installer backs up replaced baseline
+files under `.pulsar-openfhe-backup-v1.3.2/`.
 
 ## Requirements
 
+The complete build has been validated on Ubuntu 22.04 with GCC 11.4 and
+CMake 3.22.1.
+
 - Linux x86-64
-- OpenFHE 1.4.0 source code
 - CMake 3.16 or newer and a C++17 compiler
 - OpenMP
 - NTL and GMP
-- Intel HEXL and tcmalloc for the evaluated configuration
+- Autoconf, Automake, and Libtool for the bundled tcmalloc build
 - Python 3.10 or newer for installation and plaintext checks
 - Sufficient memory for `N=2^16` bootstrapping key generation
 
-On Ubuntu 22.04, the basic build dependencies can be installed with:
+On a fresh Ubuntu 22.04 server, install the system dependencies with:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git cmake clang libomp-dev \
-  libntl-dev libgmp-dev autoconf libtool python3
+sudo apt install -y build-essential cmake libntl-dev libgmp-dev \
+  autoconf automake libtool python3
 ```
 
 ## Installation
 
-Obtain the pinned OpenFHE source release and install the PULSAR extension:
+From the `PULSAR-CPU` directory, run the self-contained setup script:
 
 ```bash
-git clone --branch v1.4.0 --depth 1 \
-  https://github.com/openfheorg/openfhe-development.git \
-  ~/openfhe-development
-
-cd ~/PULSAR-CPU
-python3 install_pulsar_openfhe.py ~/openfhe-development
+cd PULSAR-artifact/PULSAR-CPU
+bash setup_cpu.sh
 ```
 
-Configure and build the four executables:
+The script uses all available CPU cores by default. To limit compilation
+parallelism, set `PULSAR_BUILD_JOBS`, for example:
 
 ```bash
-cd ~/openfhe-development
-CC=clang CXX=clang++ cmake -S . -B build \
-  -DBUILD_EXAMPLES=ON \
-  -DWITH_OPENMP=ON \
-  -DWITH_NTL=ON \
-  -DWITH_TCM=ON \
-  -DWITH_INTEL_HEXL=ON \
-  -DINTEL_HEXL_HINT_DIR="$PWD/build/install" \
-  -DMATHBACKEND=6
-
-cmake --build build --target \
-  benchmark-pulsar-single-round \
-  benchmark-pulsar-multiply \
-  benchmark-pulsar-add-chain \
-  benchmark-pulsar-vault \
-  -j"$(nproc)"
+PULSAR_BUILD_JOBS=4 bash setup_cpu.sh
 ```
 
-The installer requires exactly OpenFHE 1.4.0 because the overlay replaces a
-small number of OpenFHE internals needed for `FLEXIBLEMANUAL` scaling and FHEZ
-metadata. Installing into another OpenFHE release is rejected instead of
-silently producing an incompatible build.
+The resulting source tree and run scripts are placed in
+`PULSAR-CPU/.build/openfhe`. The evaluated build configuration enables Intel
+HEXL, NTL backend 6, OpenMP, and tcmalloc. The vendored archives are pinned to
+FHE-SIMD-ALU commit `08f1eb87434e7be072cba889270a8400bbffc08e`, Intel HEXL
+1.2.6, and Google cpu_features commit
+`32b49eb5e7809052a28422cfde2f2745fbb0eb76`. Their checksums are verified
+before extraction.
 
 ## Instruction benchmarks
 
 Each script accepts the word width and CPU thread count:
 
 ```bash
-cd ~/openfhe-development
+cd PULSAR-artifact/PULSAR-CPU/.build/openfhe
 ./run_pulsar_add.sh 128 12
 ./run_pulsar_gt.sh 128 12
 ./run_pulsar_eq.sh 128 12
@@ -183,13 +172,7 @@ Multiplication has a separate interface:
 
 ## Scheduler and applications
 
-The chained-addition interface exposes the word width, number of additions,
-and initial/final refresh controls:
-
-```bash
-OMP_NUM_THREADS=12 ./run_pulsar_add_chain.sh \
-  <word_bits> <rounds> <initial_refresh:0|1> <final_refresh:0|1>
-```
+The scheduler module was incorporated in all the application tests.
 
 Application commands are:
 
@@ -209,17 +192,6 @@ The Vault interface is
   <word_bits> <public_exchange_rate> <public_rate_scale> <threads> [repeats]
 ```
 
-Vault evaluates
-`floor(((deposit * public_exchange_rate) mod 2^w) / public_rate_scale)`.
-The public rate scale must be nonzero. Both scalar instructions use the
-FHE-SIMD-ALU Boolean-to-Boolean refresh path, including the refresh between
-multiplication and division.
-
-The threshold argument controls profiling-based Bit Clean scheduling. Setup,
-key generation, encryption, input refresh, decryption, and correctness audits
-are excluded from reported circuit latency. Online Bit Clean and refresh
-operations selected during execution are included.
-
 ## Correctness checks
 
 Run checks that do not require an OpenFHE build:
@@ -230,12 +202,3 @@ python3 tests/multiplier_plain_test.py
 python3 tests/sha256_plain_test.py
 ```
 
-Encrypted benchmarks decrypt and audit every output group after the timed
-region. Successful runs finish with `OVERALL status=PASS`.
-
-## License and attribution
-
-PULSAR-CPU is distributed under the BSD 2-Clause license. OpenFHE-derived
-files retain their original notices. Bootstrapping provenance and the boundary
-between OpenFHE, FHE-SIMD-ALU-derived support, and PULSAR-specific code are
-summarized in [NOTICE](NOTICE).

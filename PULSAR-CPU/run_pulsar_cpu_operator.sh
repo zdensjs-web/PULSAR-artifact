@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="${root}/build/lib:${root}/build/install/lib:${root}/../hexl-install/lib:${root}/../hexl-install/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 operation="${1:-add}"
 width="${2:-128}"
 threads="${3:-${OMP_NUM_THREADS:-12}}"
@@ -25,7 +28,7 @@ case "${output_refresh}" in
   *) echo "output_refresh must be 0 or 1" >&2; exit 2 ;;
 esac
 
-binary="./build/bin/examples/pke/benchmark-pulsar-single-round"
+binary="${root}/build/bin/examples/pke/benchmark-pulsar-single-round"
 if [[ ! -x "${binary}" ]]; then
   echo "missing ${binary}; configure and build benchmark-pulsar-single-round first" >&2
   exit 1
